@@ -283,8 +283,13 @@ doc_events = {
         "after_insert": "inventive_helpdesk_backend.email.on_communication",
     },
     "Support Ticket": {
-        # Acknowledge every client-initiated ticket (emailed in or raised in the portal).
-        "after_insert": "inventive_helpdesk_backend.email.send_ticket_ack",
+        "after_insert": [
+            # Acknowledge every client-initiated ticket (emailed in or raised in the portal).
+            "inventive_helpdesk_backend.email.send_ticket_ack",
+            # Push a live "list changed" ping so a brand-new ticket appears in open list/board
+            # views immediately, instead of waiting for the next 30s poll.
+            "inventive_helpdesk_backend.realtime.publish_ticket_update",
+        ],
         "on_update": [
             # Keep the client in the loop on client-facing status changes (Resolved / Pending Client).
             "inventive_helpdesk_backend.email.on_ticket_update",
