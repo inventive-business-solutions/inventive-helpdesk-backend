@@ -1,0 +1,229 @@
+{
+ "actions": [],
+ "allow_rename": 1,
+ "creation": "2026-07-14 17:01:50.686272",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "title",
+  "ticket_type",
+  "priority",
+  "status",
+  "col1",
+  "client",
+  "division",
+  "raised_by",
+  "assignee",
+  "assignment_group",
+  "sec_sla",
+  "due_date",
+  "sla_risk",
+  "col2",
+  "source",
+  "from_email",
+  "sec_desc",
+  "description",
+  "attachments",
+  "sec_conv",
+  "conversation",
+  "sec_collaborators",
+  "collaborators",
+  "sec_notes",
+  "notes"
+ ],
+ "fields": [
+  {
+   "fieldname": "title",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Title",
+   "reqd": 1
+  },
+  {
+   "fieldname": "ticket_type",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Type",
+   "options": "Bug\nQuery\nImprovement\nNew Feature"
+  },
+  {
+   "default": "Medium",
+   "fieldname": "priority",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Priority",
+   "options": "Critical\nHigh\nMedium\nLow"
+  },
+  {
+   "default": "New",
+   "fieldname": "status",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Status",
+   "options": "New\nAcknowledged\nIn Progress\nPending Client\nResolved\nClosed\nReopened"
+  },
+  {
+   "fieldname": "col1",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "client",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Client",
+   "options": "Client"
+  },
+  {
+   "fieldname": "division",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Division",
+   "options": "Division"
+  },
+  {
+   "fieldname": "raised_by",
+   "fieldtype": "Data",
+   "label": "Raised By"
+  },
+  {
+   "fieldname": "assignee",
+   "fieldtype": "Link",
+   "label": "Assigned To",
+   "options": "Team Member"
+  },
+  {
+   "fieldname": "assignment_group",
+   "fieldtype": "Link",
+   "label": "Assignment Group",
+   "options": "Assignment Group"
+  },
+  {
+   "fieldname": "sec_sla",
+   "fieldtype": "Section Break",
+   "label": "SLA"
+  },
+  {
+   "fieldname": "due_date",
+   "fieldtype": "Date",
+   "label": "Due Date"
+  },
+  {
+   "default": "0",
+   "fieldname": "sla_risk",
+   "fieldtype": "Check",
+   "label": "SLA Risk"
+  },
+  {
+   "fieldname": "col2",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "Portal",
+   "fieldname": "source",
+   "fieldtype": "Select",
+   "label": "Source",
+   "options": "Portal\nEmail"
+  },
+  {
+   "fieldname": "from_email",
+   "fieldtype": "Data",
+   "label": "From Email"
+  },
+  {
+   "fieldname": "sec_desc",
+   "fieldtype": "Section Break",
+   "label": "Description"
+  },
+  {
+   "fieldname": "description",
+   "fieldtype": "Text",
+   "label": "Description"
+  },
+  {
+   "description": "JSON list of {name, url} for files attached to the initial request. Set server-side (inventive_helpdesk_backend.api.upload_attachment).",
+   "fieldname": "attachments",
+   "fieldtype": "Long Text",
+   "label": "Attachments",
+   "read_only": 1
+  },
+  {
+   "fieldname": "sec_conv",
+   "fieldtype": "Section Break",
+   "label": "Conversation"
+  },
+  {
+   "fieldname": "conversation",
+   "fieldtype": "Table",
+   "label": "Conversation",
+   "options": "Ticket Message"
+  },
+  {
+   "fieldname": "sec_collaborators",
+   "fieldtype": "Section Break",
+   "label": "Collaborators"
+  },
+  {
+   "description": "Additional teams/members looped in to coordinate on this ticket. They gain read access and can post internal notes, without taking ownership. Maintained server-side (inventive_helpdesk_backend.api.add_collaborator / remove_collaborator).",
+   "fieldname": "collaborators",
+   "fieldtype": "Table",
+   "label": "Collaborators",
+   "options": "Ticket Collaborator"
+  },
+  {
+   "fieldname": "sec_notes",
+   "fieldtype": "Section Break",
+   "label": "Internal Work Notes",
+   "permlevel": 1
+  },
+  {
+   "fieldname": "notes",
+   "fieldtype": "Table",
+   "label": "Work Notes",
+   "options": "Work Note",
+   "permlevel": 1
+  }
+ ],
+ "grid_page_length": 50,
+ "index_web_pages_for_search": 1,
+ "links": [],
+ "modified": "2026-07-15 18:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Inventive Helpdesk",
+ "name": "Support Ticket",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "Support Team",
+   "share": 1,
+   "write": 1
+  },
+  {
+   "permlevel": 1,
+   "read": 1,
+   "report": 1,
+   "role": "Support Team",
+   "write": 1
+  },
+  {
+   "create": 1,
+   "read": 1,
+   "role": "Support Client"
+  }
+ ],
+ "row_format": "Dynamic",
+ "rows_threshold_for_grid_search": 20,
+ "sender_field": "from_email",
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "subject_field": "title",
+ "title_field": "title"
+}
