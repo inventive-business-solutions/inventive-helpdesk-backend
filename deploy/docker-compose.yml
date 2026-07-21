@@ -1,7 +1,5 @@
 x-custom-image: &custom_image
-  image: ${IMAGE_NAME}:${VERSION?No version set}
-
-version: "3.9"
+  image: ${IMAGE_NAME:?No image set}:${VERSION:?No version set}
 
 services:
   backend:
@@ -15,10 +13,7 @@ services:
       - mariadb-network
       - bench-network
     healthcheck:
-      test:
-        - CMD
-        - wait-for-it
-        - "0.0.0.0:8000"
+      test: ["CMD", "wait-for-it", "0.0.0.0:8000"]
       interval: 2s
       timeout: 10s
       retries: 30
@@ -32,34 +27,32 @@ services:
         condition: on-failure
       labels:
         - traefik.enable=true
-        - traefik.docker.network=traefik-public
+        - traefik.swarm.network=traefik-public
         - traefik.constraint-label=traefik-public
-        - traefik.http.middlewares.prod-redirect.redirectscheme.scheme=https
-        - traefik.http.routers.${BENCH_NAME:-erpnext}-http.rule=Host(`${SITE_NAME:?No site name set}`)
-        - traefik.http.routers.${BENCH_NAME:-erpnext}-http.entrypoints=http
-        - traefik.http.routers.${BENCH_NAME:-erpnext}-http.middlewares=prod-redirect
-        - traefik.http.routers.${BENCH_NAME:-erpnext}-https.rule=Host(`${SITE_NAME}`)
-        - traefik.http.routers.${BENCH_NAME:-erpnext}-https.entrypoints=https
-        - traefik.http.routers.${BENCH_NAME:-erpnext}-https.tls=true
-        - traefik.http.routers.${BENCH_NAME:-erpnext}-https.tls.certresolver=le
-        - traefik.http.services.${BENCH_NAME:-erpnext}.loadbalancer.server.port=8080
+        - traefik.http.middlewares.${BENCH_NAME:-inventive_helpdesk_bench}-redirect.redirectscheme.scheme=https
+        - traefik.http.routers.${BENCH_NAME:-inventive_helpdesk_bench}-http.rule=Host(${SITES:?No sites set})
+        - traefik.http.routers.${BENCH_NAME:-inventive_helpdesk_bench}-http.entrypoints=web
+        - traefik.http.routers.${BENCH_NAME:-inventive_helpdesk_bench}-http.middlewares=${BENCH_NAME:-inventive_helpdesk_bench}-redirect
+        - traefik.http.routers.${BENCH_NAME:-inventive_helpdesk_bench}-https.rule=Host(${SITES})
+        - traefik.http.routers.${BENCH_NAME:-inventive_helpdesk_bench}-https.entrypoints=websecure
+        - traefik.http.routers.${BENCH_NAME:-inventive_helpdesk_bench}-https.tls=true
+        - traefik.http.routers.${BENCH_NAME:-inventive_helpdesk_bench}-https.tls.certresolver=le
+        - traefik.http.services.${BENCH_NAME:-inventive_helpdesk_bench}.loadbalancer.server.port=8080
     environment:
       BACKEND: backend:8000
-      FRAPPE_SITE_NAME_HEADER: $host
+      FRAPPE_SITE_NAME_HEADER: $$host
       SOCKETIO: websocket:9000
       UPSTREAM_REAL_IP_ADDRESS: 127.0.0.1
       UPSTREAM_REAL_IP_HEADER: X-Forwarded-For
       UPSTREAM_REAL_IP_RECURSIVE: "off"
+      CLIENT_MAX_BODY_SIZE: ${CLIENT_MAX_BODY_SIZE:-1024m}
     volumes:
       - sites:/home/frappe/frappe-bench/sites
     networks:
       - bench-network
       - traefik-public
     healthcheck:
-      test:
-        - CMD
-        - wait-for-it
-        - "0.0.0.0:8080"
+      test: ["CMD", "wait-for-it", "0.0.0.0:8080"]
       interval: 2s
       timeout: 30s
       retries: 30
@@ -69,21 +62,14 @@ services:
     deploy:
       restart_policy:
         condition: on-failure
-    command:
-      - bench
-      - worker
-      - --queue
-      - default
+    command: bench worker --queue default
     volumes:
       - sites:/home/frappe/frappe-bench/sites
     networks:
       - mariadb-network
       - bench-network
     healthcheck:
-      test:
-        - CMD
-        - wait-for-it
-        - "redis-queue:6379"
+      test: ["CMD", "wait-for-it", "redis-queue:6379"]
       interval: 2s
       timeout: 10s
       retries: 30
@@ -93,21 +79,14 @@ services:
     deploy:
       restart_policy:
         condition: on-failure
-    command:
-      - bench
-      - worker
-      - --queue
-      - long
+    command: bench worker --queue long,default,short
     volumes:
       - sites:/home/frappe/frappe-bench/sites
     networks:
       - mariadb-network
       - bench-network
     healthcheck:
-      test:
-        - CMD
-        - wait-for-it
-        - "redis-queue:6379"
+      test: ["CMD", "wait-for-it", "redis-queue:6379"]
       interval: 2s
       timeout: 10s
       retries: 30
@@ -117,21 +96,14 @@ services:
     deploy:
       restart_policy:
         condition: on-failure
-    command:
-      - bench
-      - worker
-      - --queue
-      - short
+    command: bench worker --queue short,default
     volumes:
       - sites:/home/frappe/frappe-bench/sites
     networks:
       - mariadb-network
       - bench-network
     healthcheck:
-      test:
-        - CMD
-        - wait-for-it
-        - "redis-queue:6379"
+      test: ["CMD", "wait-for-it", "redis-queue:6379"]
       interval: 2s
       timeout: 10s
       retries: 30
@@ -141,19 +113,14 @@ services:
     deploy:
       restart_policy:
         condition: on-failure
-    command:
-      - bench
-      - schedule
+    command: bench schedule
     volumes:
       - sites:/home/frappe/frappe-bench/sites
     networks:
       - mariadb-network
       - bench-network
     healthcheck:
-      test:
-        - CMD
-        - wait-for-it
-        - "redis-queue:6379"
+      test: ["CMD", "wait-for-it", "redis-queue:6379"]
       interval: 2s
       timeout: 10s
       retries: 30
@@ -172,10 +139,7 @@ services:
       - mariadb-network
       - bench-network
     healthcheck:
-      test:
-        - CMD
-        - wait-for-it
-        - "0.0.0.0:9000"
+      test: ["CMD", "wait-for-it", "0.0.0.0:9000"]
       interval: 2s
       timeout: 10s
       retries: 30
@@ -193,6 +157,7 @@ services:
         bench --site all set-config -p maintenance_mode 1
         bench --site all set-config -p pause_scheduler 1
         bench --site all migrate
+        bench --site all set-config -g chromium_path /usr/bin/chromium-headless-shell
         bench --site all set-config -p maintenance_mode 0
         bench --site all set-config -p pause_scheduler 0
     volumes:
@@ -200,37 +165,6 @@ services:
     networks:
       - mariadb-network
       - bench-network
-
-  backup-sites:
-    <<: *custom_image
-    deploy:
-      mode: replicated
-      replicas: 0
-      labels:
-        - "swarm.cronjob.enable=true"
-        - "swarm.cronjob.schedule=0 */6 * * *"
-        - "swarm.cronjob.skip-running=false"
-      restart_policy:
-        condition: none
-    entrypoint: ["bash", "-c"]
-    command:
-      - |
-        bench --site all backup
-        ## Uncomment for restic snapshots.
-        # restic snapshots || restic init
-        # restic backup sites
-        ## Uncomment to keep only last 30 snapshots.
-        # restic forget --group-by=paths --keep-last=30 --prune
-    environment:
-      - RESTIC_REPOSITORY=${RESTIC_REPOSITORY}
-      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
-      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
-      - RESTIC_PASSWORD=${RESTIC_PASSWORD}
-    volumes:
-      - "sites:/home/frappe/frappe-bench/sites"
-    networks:
-      - bench-network
-      - mariadb-network
 
   configurator:
     <<: *custom_image
@@ -244,18 +178,19 @@ services:
     entrypoint: ["bash", "-c"]
     command:
       - >
+        ls -1 apps > sites/apps.txt;
         bench set-config -g db_host $$DB_HOST;
         bench set-config -gp db_port $$DB_PORT;
         bench set-config -g redis_cache "redis://$$REDIS_CACHE";
         bench set-config -g redis_queue "redis://$$REDIS_QUEUE";
-        bench set-config -g redis_socketio "redis://$$REDIS_SOCKETIO";
+        bench set-config -g redis_socketio "redis://$$REDIS_QUEUE";
         bench set-config -gp socketio_port $$SOCKETIO_PORT;
+        bench set-config -g chromium_path /usr/bin/chromium-headless-shell;
     environment:
       DB_HOST: ${DB_HOST:-mariadb_db}
       DB_PORT: ${DB_PORT:-3306}
       REDIS_CACHE: redis-cache:6379
       REDIS_QUEUE: redis-queue:6379
-      REDIS_SOCKETIO: redis-socketio:6379
       SOCKETIO_PORT: 9000
 
   create-site:
@@ -284,12 +219,12 @@ services:
           fi
         done;
         echo "sites/common_site_config.json found";
-        [[ -d "sites/$$SITE_NAME" ]] && echo "$$SITE_NAME already exists" && exit 0;
-        bench new-site --mariadb-user-host-login-scope='%' --admin-password=$$ADMIN_PASSWORD --db-root-username=root --db-root-password=$$DB_ROOT_PASSWORD $$INSTALL_APP_ARGS $$SITE_NAME;
+        [[ -d "sites/$${SITE_NAME}" ]] && echo "$${SITE_NAME} already exists" && exit 0;
+        bench new-site --mariadb-user-host-login-scope='%' --admin-password=$${ADMIN_PASSWORD} --db-root-username=root --db-root-password=$${DB_ROOT_PASSWORD} $${INSTALL_APP_ARGS} $${SITE_NAME};
     volumes:
       - sites:/home/frappe/frappe-bench/sites
     environment:
-      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
       DB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
       INSTALL_APP_ARGS: ${INSTALL_APP_ARGS}
       SITE_NAME: ${SITE_NAME}
@@ -297,24 +232,47 @@ services:
       - bench-network
       - mariadb-network
 
+  backup-sites:
+    <<: *custom_image
+    deploy:
+      mode: replicated
+      replicas: 0
+      labels:
+        - "swarm.cronjob.enable=true"
+        - "swarm.cronjob.schedule=0 */6 * * *"
+        - "swarm.cronjob.skip-running=false"
+      restart_policy:
+        condition: none
+    entrypoint: ["bash", "-c"]
+    command:
+      - bench --site all backup
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+    networks:
+      - bench-network
+      - mariadb-network
+
   redis-cache:
-    image: redis:7-alpine
+    # Pinned to the linux/amd64 digest of redis:7-alpine so Swarm always pulls
+    # the correct architecture (a service-level `platform:` key is rejected by
+    # docker stack deploy: "Additional property platform is not allowed").
+    image: redis:7-alpine@sha256:b1addbe72465a718643cff9e60a58e6df1841e29d6d7d60c9a85d8d72f08d1a7
     deploy:
       restart_policy:
         condition: on-failure
     networks:
       - bench-network
     healthcheck:
-      test:
-        - CMD
-        - redis-cli
-        - ping
+      test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 5s
       retries: 3
 
   redis-queue:
-    image: redis:7-alpine
+    # Pinned to the linux/amd64 digest of redis:7-alpine so Swarm always pulls
+    # the correct architecture (a service-level `platform:` key is rejected by
+    # docker stack deploy: "Additional property platform is not allowed").
+    image: redis:7-alpine@sha256:b1addbe72465a718643cff9e60a58e6df1841e29d6d7d60c9a85d8d72f08d1a7
     deploy:
       restart_policy:
         condition: on-failure
@@ -323,40 +281,18 @@ services:
     networks:
       - bench-network
     healthcheck:
-      test:
-        - CMD
-        - redis-cli
-        - ping
-      interval: 5s
-      timeout: 5s
-      retries: 3
-
-  redis-socketio:
-    image: redis:7-alpine
-    deploy:
-      restart_policy:
-        condition: on-failure
-    volumes:
-      - redis-socketio-data:/data
-    networks:
-      - bench-network
-    healthcheck:
-      test:
-        - CMD
-        - redis-cli
-        - ping
+      test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 5s
       retries: 3
 
 volumes:
   redis-queue-data:
-  redis-socketio-data:
   sites:
 
 networks:
   bench-network:
-    name: ${BENCH_NAME:-erpnext}
+    name: ${BENCH_NAME:-inventive_helpdesk_bench}
     external: false
   mariadb-network:
     name: mariadb-network
@@ -364,18 +300,23 @@ networks:
   traefik-public:
     name: traefik-public
     external: true
+
 # ------------------------+--------------------------------------+---------
 # Env Variables           | Description                          | Default
 # ------------------------+--------------------------------------+---------
-# AWS_ACCESS_KEY_ID       | AWS Access Key for restic            | nil
-# AWS_SECRET_ACCESS_KEY   | AWS Secret Key for restic            | nil
-# BENCH_NAME              | Name of the bench network            | erpnext
-# IMAGE_NAME              | Container image to use               | nil
-# MIGRATE                 | Enable migration on deploy           | 1
-# CONFIGURE               | Re-generate common_site_config.json  | 0
-# CREATE_SITE             | Enable site creation on deploy       | 0
-# RESTIC_PASSWORD         | Restic Password. DO NOT Forget!      | nil
-# RESTIC_REPOSITORY       | Path Styled S3 endpoint              | nil
-# SITE_NAME               | Frappe site domain name              | nil
-# VERSION                 | Mandatory image tag to use           | nil
+# ADMIN_PASSWORD          | Admin password for new site           | nil
+# BENCH_NAME              | Name of the bench network             | inventive_helpdesk_bench
+# CLIENT_MAX_BODY_SIZE    | Nginx max upload size                 | 1024m
+# CONFIGURE               | Re-generate common_site_config.json   | 0
+# CREATE_SITE             | Enable site creation on deploy        | 0
+# DB_HOST                 | MariaDB host                          | mariadb_db
+# DB_PORT                 | MariaDB port                          | 3306
+# DB_ROOT_PASSWORD        | MariaDB root password                 | nil
+# IMAGE_NAME              | Container image to use                | nil
+# INSTALL_APP_ARGS        | bench install-app args                | nil
+# MIGRATE                 | Enable migration on deploy            | 1
+# SITES                   | Backtick-quoted site domains          | nil
+#                         | e.g. `site.domain.com`                |
+# SITE_NAME               | Frappe site domain (create-site)      | nil
+# VERSION                 | Mandatory image tag to use            | nil
 # ------------------------+--------------------------------------+---------

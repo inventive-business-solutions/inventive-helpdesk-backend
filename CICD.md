@@ -1,7 +1,7 @@
 # CI/CD — Inventive Helpdesk Backend
 
-Frappe app deployed on Docker Swarm via Portainer CE, behind Traefik. Adapted from the
-`tei-suit-backend` template and running on the same ARM64 infrastructure.
+Frappe app deployed on Docker Swarm via Portainer CE, behind Traefik. Adapted from
+`samanvay-sangam-backend`, which runs on the same x86_64 Swarm node.
 
 > **Scope:** this pipeline deploys the **Frappe backend only**. The `frontend` service in
 > `deploy/docker-compose.yml` is Frappe's own nginx (serves desk assets, proxies to
@@ -30,8 +30,8 @@ merging `development` → `master`, which is the branch the hosted environment t
 merge development -> master  (release)
        │
        ▼
-GitHub Actions (self-hosted, dev-arm64)
-       ├── build image from frappe_docker Containerfile (linux/arm64)
+GitHub Actions (self-hosted, inventive-microscan)
+       ├── build image from frappe_docker Containerfile (linux/amd64)
        └── push to GHCR (:<sha> and :latest)
        ▼
 you, in Portainer: Update the stack (Re-pull image)
@@ -54,6 +54,18 @@ CE and can be called from the workflow after the push step.
 Build args pin the stack to match local dev: Frappe `version-16`, Python `3.14.0`,
 Node `24.1.0`.
 
+**Architecture matters.** The Swarm node is `linux/x86_64`, so the image is built
+`linux/amd64` on the x86_64 `inventive-microscan` runner. Building `linux/arm64` (as an
+earlier revision did) leaves every task stuck in `pending` with
+`no suitable node (unsupported platform on 1 node)` — the Redis services still start,
+because their image is multi-arch, which makes the failure look partial.
+
+Two build flags are deliberate, both mirroring `samanvay-sangam-backend`:
+`provenance: false` keeps the manifest single-platform, and `no-cache: true` prevents
+the GHA layer cache reusing the `bench get-app` layer, which silently shipped stale app
+code. Each build stamps `build_sha.txt` into the image so a running container can be
+matched to its commit.
+
 ---
 
 ## Server prerequisites
@@ -65,7 +77,7 @@ The compose file declares these as **external** — it will not create them:
 | `traefik-public` network | Traefik with the `le` certresolver |
 | `mariadb-network` network | MariaDB reachable as `mariadb_db:3306`, plus its root password |
 | Docker Swarm + Portainer CE | hosts the stack; deploys are triggered manually |
-| Runner labelled `dev-arm64` | self-hosted; image is `linux/arm64` only |
+| Runner labelled `inventive-microscan` | self-hosted, x86_64; builds `linux/amd64` |
 
 ---
 
@@ -130,7 +142,7 @@ it needs its own Portainer stack, domain and `SITE_NAME`.
 4. Repository reference: `refs/heads/master` — this is the hosted branch
 5. Compose path: `deploy/docker-compose.yml`
 6. GitOps updates: **OFF** (webhooks are Business Edition; see above)
-7. Add environment variables from `deploy/.env.example`
+7. Add environment variables from `deploy/.env.example` — note `SITES` **includes backticks** in its value
 8. Deploy the stack
 
 > Create the stack **after** the first image exists in GHCR, otherwise the initial
@@ -146,6 +158,7 @@ Set these in Portainer for the initial run:
 CONFIGURE=1
 CREATE_SITE=1
 MIGRATE=0
+SITES=`helpdeskfrappe.inventivebizsol.co.in`
 SITE_NAME=helpdeskfrappe.inventivebizsol.co.in
 ADMIN_PASSWORD=<choose>
 DB_ROOT_PASSWORD=<mariadb root password>
@@ -209,12 +222,16 @@ docker service update \
 
 ## Notes on this pipeline vs the template
 
-Two deliberate changes from `tei-suit-backend`:
+The compose and workflow are adapted from **`samanvay-sangam-backend`**, which runs on
+this same Swarm node — not from `tei-suit-backend`, which targets ARM infrastructure
+elsewhere. Deliberate differences from that reference:
 
 1. **`APPS_JSON_BASE64` is a secret, not a variable.** GitHub variables are not masked in
    logs and are readable by anyone with repo read access; this one embeds a PAT. The
    workflow also passes it via `env:` rather than inlining it, so the value never appears
    in the rendered command.
-2. **The CD steps are removed entirely.** The template's webhook-based deploy and
-   health check require Portainer Business Edition. On CE this pipeline builds and
-   pushes only; releasing is a manual step in Portainer.
+2. **No CD step.** `samanvay-sangam-backend` posts to a `PORTAINER_WEBHOOK_URL` and
+   then verifies the deployed `build_sha`. No webhook URL is configured for this stack
+   yet, so releasing is a manual *Update the stack* in Portainer. If a webhook becomes
+   available, add the Deploy and Verify steps back — the `build_sha.txt` stamp needed
+   for verification is already built into the image.

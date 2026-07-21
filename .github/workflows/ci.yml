@@ -1,0 +1,125 @@
+name: INVENTIVE HELPDESK BACKEND CI/CD PIPELINE
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  # ============================================================
+  # Build & Push — Production
+  # ============================================================
+  BUILD_AND_DEPLOY_PROD:
+    name: Build & Push (Production)
+    if: github.ref == 'refs/heads/master'
+    runs-on: [self-hosted, inventive-microscan]
+    environment: Production
+
+    steps:
+      - name: Checkout Main Repository
+        uses: actions/checkout@v6
+
+      # Fail fast with a readable message. Without this an unset IMAGE_NAME only
+      # surfaces several steps later as `invalid tag ":<sha>": invalid reference format`.
+      - name: Validate required configuration
+        env:
+          IMAGE_NAME: ${{ vars.IMAGE_NAME }}
+          APPS_JSON_BASE64: ${{ secrets.APPS_JSON_BASE64 }}
+        run: |
+          missing=""
+          [ -z "$IMAGE_NAME" ]       && missing="$missing IMAGE_NAME(variable)"
+          [ -z "$APPS_JSON_BASE64" ] && missing="$missing APPS_JSON_BASE64(secret)"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing required config on the Production environment:$missing"
+            exit 1
+          fi
+          echo "Configuration present."
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Checkout Frappe Docker Repository
+        uses: actions/checkout@v6
+        with:
+          repository: frappe/frappe_docker
+          path: builds
+
+      # Stamps the built commit inside the image so a deploy can be verified as
+      # actually running this build rather than a cached older one.
+      - name: Inject build SHA into Containerfile
+        run: |
+          echo "" >> builds/images/custom/Containerfile
+          echo "ARG BUILD_SHA=dev" >> builds/images/custom/Containerfile
+          echo 'RUN echo "${BUILD_SHA}" > /home/frappe/frappe-bench/apps/inventive_helpdesk_backend/inventive_helpdesk_backend/build_sha.txt' >> builds/images/custom/Containerfile
+
+      # APPS_JSON_BASE64 carries a PAT, so it lives in secrets (not vars) to keep it
+      # masked in run logs, and is piped via env so it is never rendered into the command.
+      - name: Export apps.json from base64
+        env:
+          APPS_JSON_BASE64: ${{ secrets.APPS_JSON_BASE64 }}
+        run: printf '%s' "$APPS_JSON_BASE64" | base64 -d > builds/apps.json
+
+      - name: Build and Push AMD64 Docker Image
+        uses: docker/build-push-action@v7
+        with:
+          context: builds
+          file: builds/images/custom/Containerfile
+          push: true
+          tags: |
+            ${{ vars.IMAGE_NAME }}:${{ github.sha }}
+            ${{ vars.IMAGE_NAME }}:latest
+          # Must match the Swarm node's architecture (linux/x86_64). A mismatch shows up
+          # as "no suitable node (unsupported platform)" with tasks stuck pending.
+          platforms: linux/amd64
+          # Keeps the manifest single-platform; provenance attestations add an
+          # "unknown/unknown" entry that confuses some registry/pull paths.
+          provenance: false
+          # Cache disabled on purpose: the GHA layer cache was reusing the
+          # `bench get-app` layer, so new app commits never made it into the
+          # image (while build_sha.txt still updated, masking the staleness).
+          # A full rebuild is slower but guarantees the latest app code ships.
+          no-cache: true
+          build-args: |
+            FRAPPE_PATH=https://github.com/frappe/frappe
+            FRAPPE_BRANCH=version-16
+            PYTHON_VERSION=3.14.0
+            NODE_VERSION=24.1.0
+            BUILD_SHA=${{ github.sha }}
+          secret-files: |
+            apps_json=builds/apps.json
+
+      # No CD step yet: this stack has no Portainer webhook URL configured. Releasing
+      # is currently a manual "Update the stack" with Re-pull image in Portainer. If a
+      # webhook is available, add a Deploy step posting to it, then a Verify step
+      # polling the health endpoint until build_sha matches github.sha.
+      - name: Build Summary
+        if: always()
+        run: |
+          echo "## Build Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Detail | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|--------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Environment** | Production |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Image** | \`${{ vars.IMAGE_NAME }}:${{ github.sha }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Platform** | \`linux/amd64\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Branch** | \`${{ github.ref_name }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Commit** | [\`${GITHUB_SHA::7}\`](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Triggered by** | ${{ github.actor }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Image pushed to GHCR. To release it: open the stack in Portainer and" >> "$GITHUB_STEP_SUMMARY"
+          echo "choose **Update the stack** with *Re-pull image* enabled." >> "$GITHUB_STEP_SUMMARY"
