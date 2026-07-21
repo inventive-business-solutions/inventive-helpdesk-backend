@@ -98,7 +98,16 @@ jobs:
           no-cache: true
           build-args: |
             FRAPPE_PATH=https://github.com/frappe/frappe
-            FRAPPE_BRANCH=version-16
+            # Pinned to a tag, not the version-16 branch. On a branch every rebuild
+            # picked up whatever the tip happened to be that day, so the framework
+            # could change under production with no commit here to show for it — and
+            # local benches, which are checked out at a fixed tag, would not reproduce
+            # it. Bumping this is now a deliberate, reviewable change.
+            #
+            # Trade-off: security fixes on version-16 no longer arrive automatically.
+            # Bump this line when you take one, and move the local bench to match:
+            #   cd apps/frappe && git fetch --tags && git checkout v<new>
+            FRAPPE_BRANCH=v16.27.1
             PYTHON_VERSION=3.14.0
             NODE_VERSION=24.1.0
             BUILD_SHA=${{ github.sha }}
