@@ -4,6 +4,15 @@ x-custom-image: &custom_image
 services:
   backend:
     <<: *custom_image
+    environment:
+      # Makes Frappe wrap the WSGI app in Werkzeug's ProxyFix, so it reads the real
+      # scheme from X-Forwarded-Proto instead of the plain HTTP it receives from
+      # Traefik. Without it `frappe.local.request.scheme` is "http", and
+      # CookieManager.set_cookie derives `secure` from exactly that — so the session
+      # cookie ships without the Secure flag on an HTTPS-only site.
+      # See frappe/app.py (`if proxy or os.environ.get("USE_PROXY")`) and
+      # frappe/auth.py (`secure = frappe.local.request.scheme == "https"`).
+      USE_PROXY: "1"
     deploy:
       restart_policy:
         condition: on-failure
