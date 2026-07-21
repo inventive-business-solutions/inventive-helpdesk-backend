@@ -32,14 +32,24 @@ merge development -> master  (release)
        ▼
 GitHub Actions (self-hosted, dev-arm64)
        ├── build image from frappe_docker Containerfile (linux/arm64)
-       ├── push to GHCR (:<sha> and :latest)
-       ├── POST Portainer webhook
-       └── poll https://<SITE_NAME>/api/method/ping until HTTP 200
+       └── push to GHCR (:<sha> and :latest)
        ▼
-Portainer CE → Docker Swarm
-       ├── re-pull image, redeploy services
+you, in Portainer: Update the stack (Re-pull image)
+       ▼
+Docker Swarm
+       ├── pulls the new image, redeploys services
        └── migration service: bench --site all migrate
 ```
+
+**CI builds; deploys are manual.** Portainer CE has no stack webhook (Business Edition
+only), and its polling alternative triggers on the git commit rather than the image
+push — so it can redeploy before the new image has finished uploading, and will not
+retry for that commit. Rather than risk a silently stale deploy behind a green
+pipeline, releases are a deliberate click in Portainer.
+
+If deploys become frequent enough to be annoying, the Portainer REST API
+(`PUT /api/stacks/{id}/git/redeploy?endpointId={envId}`, header `X-API-Key`) works on
+CE and can be called from the workflow after the push step.
 
 Build args pin the stack to match local dev: Frappe `version-16`, Python `3.14.0`,
 Node `24.1.0`.
@@ -54,7 +64,7 @@ The compose file declares these as **external** — it will not create them:
 | --- | --- |
 | `traefik-public` network | Traefik with the `le` certresolver |
 | `mariadb-network` network | MariaDB reachable as `mariadb_db:3306`, plus its root password |
-| Docker Swarm + Portainer CE | stack with GitOps webhook |
+| Docker Swarm + Portainer CE | hosts the stack; deploys are triggered manually |
 | Runner labelled `dev-arm64` | self-hosted; image is `linux/arm64` only |
 
 ---
@@ -66,14 +76,17 @@ The compose file declares these as **external** — it will not create them:
 | Variable | Development | Production |
 | --- | --- | --- |
 | `IMAGE_NAME` | `ghcr.io/inventive-business-solutions/inventive-helpdesk-backend` | `ghcr.io/inventive-business-solutions/prod-inventive-helpdesk-backend` |
-| `SITE_NAME` | `helpdeskfrappe.inventivebizsol.co.in` | _(prod domain)_ |
+| `SITE_NAME` | `helpdeskfrappe.inventivebizsol.co.in` | `helpdeskfrappe.inventivebizsol.co.in` |
+
+`IMAGE_NAME` is the only variable CI currently reads. `SITE_NAME` is kept for the
+Portainer stack (Traefik routing and site creation) and for the health check, should the
+API-based deploy step be added later.
 
 ### Secrets (per environment)
 
 | Secret | Notes |
 | --- | --- |
 | `APPS_JSON_BASE64` | Base64 apps.json containing a classic PAT — **a secret, not a variable**, so it stays masked in run logs |
-| `PORTAINER_WEBHOOK_URL` | From the Portainer stack's GitOps webhook |
 
 Generate `APPS_JSON_BASE64` with a **classic** PAT scoped to `repo` only
 (fine-grained PATs are per-repo and `GITHUB_TOKEN` does not work inside BuildKit for
@@ -102,11 +115,10 @@ gh variable set SITE_NAME  --repo $REPO --env Production \
   --body "helpdeskfrappe.inventivebizsol.co.in"
 
 gh secret set APPS_JSON_BASE64      --repo $REPO --env Production --body "<base64-master-value>"
-gh secret set PORTAINER_WEBHOOK_URL --repo $REPO --env Production --body "<webhook-url>"
 ```
 
 Add the Development environment later if you want a second stack tracking `development`;
-it needs its own Portainer stack, webhook and `SITE_NAME`.
+it needs its own Portainer stack, domain and `SITE_NAME`.
 
 ---
 
@@ -117,10 +129,12 @@ it needs its own Portainer stack, webhook and `SITE_NAME`.
 3. Authentication: ON (GitHub username + PAT)
 4. Repository reference: `refs/heads/master` — this is the hosted branch
 5. Compose path: `deploy/docker-compose.yml`
-6. GitOps updates: ON → **Webhook**, enable *Re-pull image* + *Force redeployment*
-7. Copy the webhook URL into the `PORTAINER_WEBHOOK_URL` secret
-8. Add environment variables from `deploy/.env.example`
-9. Deploy the stack
+6. GitOps updates: **OFF** (webhooks are Business Edition; see above)
+7. Add environment variables from `deploy/.env.example`
+8. Deploy the stack
+
+> Create the stack **after** the first image exists in GHCR, otherwise the initial
+> deploy fails with nothing to pull.
 
 ---
 
@@ -190,10 +204,6 @@ docker service update \
 | Build fails, `git clone ... exit status 128` | PAT lacks access to the repo | New classic PAT with `repo` scope; update `APPS_JSON_BASE64` |
 | Configurator: `Missing argument 'VALUE'` | `$VAR` substituted by Compose at parse time | Use `$$VAR` in compose command blocks |
 | Traefik 404 | `SITE_NAME` unset, or DNS not pointing at the host | Verify DNS and the `SITE_NAME` env var |
-| Webhook returns non-200/204 | Wrong URL, or Portainer down | Re-copy the webhook URL from the stack |
-| Deploy step skipped | `PORTAINER_WEBHOOK_URL` unset for that environment | Set the secret on the environment |
-| Verify fails, exit 60 | TLS verification failed on the runner | Update the runner's CA certificates |
-| Verify times out (~240s) | App never returned 200 | Check Portainer logs — usually migration failure, missing env var, or DB connectivity |
 
 ---
 
@@ -205,6 +215,6 @@ Two deliberate changes from `tei-suit-backend`:
    logs and are readable by anyone with repo read access; this one embeds a PAT. The
    workflow also passes it via `env:` rather than inlining it, so the value never appears
    in the rendered command.
-2. **The duplicate `Deploy to Server` step is removed.** The template fires the Portainer
-   webhook a second time after the health check, which redeploys the build it just
-   verified.
+2. **The CD steps are removed entirely.** The template's webhook-based deploy and
+   health check require Portainer Business Edition. On CE this pipeline builds and
+   pushes only; releasing is a manual step in Portainer.
