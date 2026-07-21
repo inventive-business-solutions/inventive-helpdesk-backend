@@ -30,22 +30,6 @@ repos:
       - id: ruff-format
         name: "Run ruff formatter"
 
-  - repo: https://github.com/pre-commit/mirrors-prettier
-    rev: v2.7.1
-    hooks:
-      - id: prettier
-        types_or: [javascript, vue, scss]
-        # Ignore any files that might contain jinja / bundles
-        exclude: |
-            (?x)^(
-                inventive_helpdesk_backend/public/dist/.*|
-                .*node_modules.*|
-                .*boilerplate.*|
-                inventive_helpdesk_backend/templates/includes/.*|
-                inventive_helpdesk_backend/public/js/lib/.*
-            )$
-
-
 ci:
     autoupdate_schedule: weekly
     skip: []
