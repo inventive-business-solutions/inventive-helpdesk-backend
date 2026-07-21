@@ -225,6 +225,10 @@ services:
       - sites:/home/frappe/frappe-bench/sites
     environment:
       ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      # Without these the command's `wait-for-it $$DB_HOST:$$DB_PORT` gets a bare
+      # ":" and aborts with a usage error, skipping the database readiness wait.
+      DB_HOST: ${DB_HOST:-mariadb_db}
+      DB_PORT: ${DB_PORT:-3306}
       DB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
       INSTALL_APP_ARGS: ${INSTALL_APP_ARGS}
       SITE_NAME: ${SITE_NAME}
