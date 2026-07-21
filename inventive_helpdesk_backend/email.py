@@ -70,7 +70,7 @@ def _queue_mail(recipient, subject, html, context):
     try:
         frappe.sendmail(recipients=[recipient], subject=subject, message=html, now=False, retry=3)
     except (frappe.OutgoingEmailError, frappe.ValidationError):
-        frappe.log_error(frappe.get_traceback(), f"{context} email failed")
+        frappe.log_error(title=f"{context} email failed")
 
 
 # ---- inbound: email → ticket ----------------------------------------------
@@ -116,7 +116,7 @@ def on_communication(doc, method=None):
         doc.db_set("reference_name", name, update_modified=False)
 
 
-@frappe.whitelist(allow_guest=True)
+@frappe.whitelist(allow_guest=True, methods=["POST"])
 def receive_webhook():
     """Local dev intake: Mailpit POSTs here for every captured message. Turn inbound support
     emails (addressed to the support inbox, not from us) into tickets. Guest-callable because
@@ -164,11 +164,11 @@ def _fetch_mailpit_body(message_id):
         if r.ok:
             return (r.json() or {}).get("Text") or ""
     except Exception:
-        frappe.log_error(frappe.get_traceback(), "Mailpit body fetch failed")
+        frappe.log_error(title="Mailpit body fetch failed")
     return ""
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def send_test_email(from_email, subject=None, body=None, from_name=None):
     """DEV-ONLY, staff-only: inject a test email into Mailpit via its send API so it flows
     through the REAL inbound pipeline (Mailpit captures it -> fires the webhook ->
@@ -208,7 +208,7 @@ def send_ticket_ack(doc, method=None):
         frappe.flags.in_install
         or frappe.flags.in_migrate
         or frappe.flags.in_import
-        or frappe.flags.in_test
+        or frappe.in_test
         or frappe.flags.get("skip_ticket_ack")
     ):
         return
@@ -253,7 +253,7 @@ def on_ticket_update(doc, method=None):
     so replies, notes and other edits don't trigger it."""
     if (
         frappe.flags.in_install or frappe.flags.in_migrate or frappe.flags.in_import
-        or frappe.flags.in_test or frappe.flags.get("skip_ticket_ack")
+        or frappe.in_test or frappe.flags.get("skip_ticket_ack")
     ):
         return
     before = doc.get_doc_before_save()

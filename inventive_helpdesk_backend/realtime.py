@@ -13,6 +13,7 @@ events, both after_commit (so a re-fetch triggered by the event reads committed 
      without leaking a ticket an agent isn't allowed to see.
 """
 import frappe
+from frappe.realtime import get_doctype_room
 
 
 def publish_ticket_update(doc, method=None):
@@ -23,9 +24,13 @@ def publish_ticket_update(doc, method=None):
         docname=doc.name,
         after_commit=True,
     )
+    # Pass `room` explicitly: publish_realtime only derives the doctype room for the
+    # built-in `list_update` event. For a custom event, doctype-without-docname falls
+    # through to the site room ("all"), which Frappe's socket handler joins for System
+    # Users only — so portal (Website User) sessions would never receive this.
     frappe.publish_realtime(
         "ticket_list_dirty",
         {},
-        doctype="Support Ticket",
+        room=get_doctype_room("Support Ticket"),
         after_commit=True,
     )

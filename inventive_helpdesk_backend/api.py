@@ -100,7 +100,7 @@ def me():
     return ctx
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def add_message(ticket: str, body: str, attachments=None):
     """Append a client-visible message. Allowed for the ticket's client POC or staff."""
     body = (body or "").strip()
@@ -125,7 +125,7 @@ def add_message(ticket: str, body: str, attachments=None):
     return doc.name
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def add_note(ticket: str, body: str, attachments=None):
     """Append an internal work note. Staff only (never visible to clients)."""
     _require_team()
@@ -143,7 +143,7 @@ def add_note(ticket: str, body: str, attachments=None):
     return doc.name
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def reopen(ticket: str):
     """Let the owning client (or staff) reopen a resolved/closed ticket."""
     doc = _require_read(ticket)
@@ -165,7 +165,7 @@ def _log_note(doc, body: str):
     doc.append("notes", {"author": _author(), "note_on": now_datetime(), "body": body})
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def claim_ticket(ticket: str):
     """Let a team member pick up a ticket from their team's queue (self-assign).
     Team-first: the ticket must already be routed to a team, and the member must
@@ -196,7 +196,7 @@ def _collab_key(row):
     return row.team if row.party_type == "Team" else row.member
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def add_collaborator(ticket: str, party_type: str, party: str):
     """Loop an additional team or member onto a ticket (a "Collaborator"). They gain
     read access and can post internal notes, without taking ownership. Staff only."""
@@ -229,7 +229,7 @@ def add_collaborator(ticket: str, party_type: str, party: str):
     return doc.name
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def remove_collaborator(ticket: str, party_type: str, party: str):
     """Remove a looped-in collaborator. Staff only."""
     _require_team()
@@ -274,7 +274,7 @@ def _attach_private_file(ticket_doc, filename, content, on_ticket=False):
     return ref
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def upload_attachment(ticket, on_ticket=0):
     """Attach a multipart-uploaded file (form field `file`) to a ticket as a private file,
     after a tenant-scope read check (client → own ticket only; staff → any). Returns
@@ -291,7 +291,7 @@ def upload_attachment(ticket, on_ticket=0):
     return _attach_private_file(doc, upload.filename, content, cint(on_ticket))
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def update_member(name, member_name=None, title=None, email=None):
     """Edit a team member. Renames the doc when member_name changes — `assignee`
     (Support Ticket) and `member` (Assignment Group) are Link fields, so Frappe
@@ -311,7 +311,7 @@ def update_member(name, member_name=None, title=None, email=None):
 
 
 # ---- client / POC administration (staff only) -----------------------------
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def update_client(name, client_name=None, client_code=None, since=None, product=None):
     """Edit a client, including a rename. `name` (autonamed from client_name) is a
     Link target on Support Ticket, Division and POC, so frappe.rename_doc cascades
@@ -332,7 +332,7 @@ def update_client(name, client_name=None, client_code=None, since=None, product=
     return name
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def update_product(name, product_name=None):
     """Rename a product. Product is autonamed by product_name and is a Link target on
     Client.product, so rename_doc cascades the new name to every client running it."""
@@ -344,7 +344,7 @@ def update_product(name, product_name=None):
     return name
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def update_poc(name, poc_name=None, email=None, is_primary=None):
     """Edit a POC. POC is autonamed by `email`, so a changed email must rename the
     doc — and if the POC already has a portal login, the User is renamed too so the
@@ -381,7 +381,7 @@ def update_poc(name, poc_name=None, email=None, is_primary=None):
     return name
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def delete_poc(name):
     """Remove a POC. POC.on_trash disables the linked portal login (unless the same
     person still covers another division), so a removed contact can no longer sign in.
@@ -478,11 +478,11 @@ def _send_invite_mail(user, context):
             user.send_welcome_mail_to_user()
         return True
     except (frappe.OutgoingEmailError, frappe.ValidationError):
-        frappe.log_error(frappe.get_traceback(), f"{context} invite email failed")
+        frappe.log_error(title=f"{context} invite email failed")
         return False
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def invite_poc(poc):
     """Provision (or re-notify) a POC's portal login. Creates a Website User with the
     Support Client role, links it back via POC.user, and emails a set-password / sign-in
@@ -508,7 +508,7 @@ def invite_poc(poc):
     return {"user": user.name, "email_sent": _send_invite_mail(user, "POC portal")}
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def invite_member(member):
     """Provision (or re-notify) a team member's staff login. Creates a System User with
     the Support Team role, links it via Team Member.user, marks the member Invited and
