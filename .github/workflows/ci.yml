@@ -2,7 +2,9 @@ name: INVENTIVE HELPDESK BACKEND CI/CD PIPELINE
 
 on:
   push:
-    branches: [master]
+    # development builds and tests but never pushes or deploys, so a failure shows up
+    # while you are still working rather than at merge time. Only master releases.
+    branches: [master, development]
   workflow_dispatch:
 
 concurrency:
@@ -15,11 +17,14 @@ permissions:
 
 jobs:
   # ============================================================
-  # Build & Push — Production
+  # Build → Test → Push → Deploy
+  #
+  # The image is built locally first and only pushed once the app's tests have
+  # passed inside it, so an untested image can never reach the registry — and
+  # therefore can never be picked up by a manual redeploy in Portainer either.
   # ============================================================
-  BUILD_AND_DEPLOY_PROD:
-    name: Build & Push (Production)
-    if: github.ref == 'refs/heads/master'
+  BUILD_TEST_DEPLOY:
+    name: Build, Test & Deploy
     runs-on: [self-hosted, inventive-microscan]
     environment: Production
 
@@ -76,12 +81,16 @@ jobs:
           APPS_JSON_BASE64: ${{ secrets.APPS_JSON_BASE64 }}
         run: printf '%s' "$APPS_JSON_BASE64" | base64 -d > builds/apps.json
 
-      - name: Build and Push AMD64 Docker Image
+      # Built into the runner's local daemon, not pushed. The push happens after the
+      # tests below, so nothing untested ever lands in the registry. Still a single
+      # build — the later push step reuses this image rather than rebuilding it.
+      - name: Build AMD64 Docker Image
         uses: docker/build-push-action@v7
         with:
           context: builds
           file: builds/images/custom/Containerfile
-          push: true
+          push: false
+          load: true
           tags: |
             ${{ vars.IMAGE_NAME }}:${{ github.sha }}
             ${{ vars.IMAGE_NAME }}:latest
@@ -114,6 +123,112 @@ jobs:
           secret-files: |
             apps_json=builds/apps.json
 
+      # ============================================================
+      # Tests
+      #
+      # Run inside the image that was just built, so what gets verified is the exact
+      # artifact that ships rather than a separately assembled bench that could drift
+      # from it. MariaDB and Redis are throwaway containers on a per-run network, torn
+      # down by the cleanup step below even when this fails.
+      #
+      # The bench setup mirrors the configurator and create-site services in
+      # deploy/docker-compose.yml, so the site is built the same way as in production.
+      # ============================================================
+      - name: Run app tests inside the built image
+        id: tests
+        env:
+          IMAGE_REF: ${{ vars.IMAGE_NAME }}:${{ github.sha }}
+          NET: ci-${{ github.run_id }}-${{ github.run_attempt }}
+          # Throwaway: this database exists only for this job and never leaves the runner.
+          DB_ROOT_PASSWORD: ci-root-not-a-secret
+        run: |
+          set -euo pipefail
+
+          docker network create "$NET"
+
+          # utf8mb4/utf8mb4_unicode_ci is what Frappe requires — site creation fails on
+          # a collation mismatch. skip-innodb-read-only-compressed keeps compressed
+          # tables writable; it defaults off on 11.8 but is set explicitly so bumping
+          # the image tag cannot silently reintroduce the problem.
+          docker run -d --name "${NET}-db" --network "$NET" \
+            -e MARIADB_ROOT_PASSWORD="$DB_ROOT_PASSWORD" \
+            mariadb:11.8 \
+            --character-set-server=utf8mb4 \
+            --collation-server=utf8mb4_unicode_ci \
+            --skip-character-set-client-handshake \
+            --skip-innodb-read-only-compressed
+
+          # The same digest the stack pins, so cache and queue behave identically here.
+          docker run -d --name "${NET}-redis" --network "$NET" \
+            redis:7-alpine@sha256:b1addbe72465a718643cff9e60a58e6df1841e29d6d7d60c9a85d8d72f08d1a7
+
+          echo "Waiting for MariaDB to accept connections..."
+          for i in $(seq 1 60); do
+            if docker exec "${NET}-db" mariadb-admin ping -uroot -p"$DB_ROOT_PASSWORD" --silent >/dev/null 2>&1; then
+              echo "MariaDB ready after ${i} attempt(s)."
+              break
+            fi
+            if [ "$i" -eq 60 ]; then
+              echo "::error::MariaDB never became ready — dumping its log"
+              docker logs "${NET}-db" 2>&1 | tail -40
+              exit 1
+            fi
+            sleep 2
+          done
+
+          # Single-quoted heredoc-style body: the variables below are expanded inside the
+          # container from the -e values, not by the runner's shell.
+          docker run --rm --network "$NET" \
+            --entrypoint bash \
+            -e DB_HOST="${NET}-db" \
+            -e REDIS_HOST="${NET}-redis" \
+            -e DB_ROOT_PASSWORD="$DB_ROOT_PASSWORD" \
+            "$IMAGE_REF" -c '
+              set -eu
+              cd /home/frappe/frappe-bench
+
+              # bench reads the app list from this file; the stack writes it the same way.
+              ls -1 apps > sites/apps.txt
+
+              bench set-config -g db_host "$DB_HOST"
+              bench set-config -gp db_port 3306
+              bench set-config -g redis_cache "redis://$REDIS_HOST:6379"
+              bench set-config -g redis_queue "redis://$REDIS_HOST:6379"
+              bench set-config -g redis_socketio "redis://$REDIS_HOST:6379"
+
+              bench new-site ci.localhost \
+                --mariadb-user-host-login-scope=% \
+                --db-root-username root \
+                --db-root-password "$DB_ROOT_PASSWORD" \
+                --admin-password ci-admin \
+                --install-app inventive_helpdesk_backend
+
+              # Frappe refuses to run tests unless the site opts in.
+              bench --site ci.localhost set-config allow_tests true
+
+              bench --site ci.localhost run-tests --app inventive_helpdesk_backend
+            '
+
+      - name: Tear down test containers
+        if: always()
+        env:
+          NET: ci-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          docker rm -f "${NET}-db" "${NET}-redis" >/dev/null 2>&1 || true
+          docker network rm "$NET" >/dev/null 2>&1 || true
+          echo "Test containers and network removed."
+
+      # Only now, with the tests green, is the image allowed into the registry — and
+      # only from master. A development run has done its job by this point and stops.
+      - name: Push image to registry
+        id: push
+        if: success() && github.ref == 'refs/heads/master'
+        run: |
+          set -euo pipefail
+          docker push "${{ vars.IMAGE_NAME }}:${{ github.sha }}"
+          docker push "${{ vars.IMAGE_NAME }}:latest"
+          echo "Pushed :${{ github.sha }} and :latest"
+
       # The stack's VERSION must be "latest" (not a pinned SHA). This webhook only
       # re-pulls the git repo and redeploys — it does not set environment variables,
       # and a ?VERSION= query parameter is silently ignored on Community Edition.
@@ -123,7 +238,7 @@ jobs:
       # Each build is also tagged :<sha>, so rollback is still a VERSION change.
       - name: Deploy to Server
         id: deploy
-        if: success()
+        if: success() && steps.push.outcome == 'success'
         env:
           WEBHOOK_URL: ${{ secrets.PORTAINER_WEBHOOK_URL }}
         run: |
@@ -171,6 +286,17 @@ jobs:
           echo "status=unhealthy" >> "$GITHUB_OUTPUT"
           exit 1
 
+      # The build is loaded into this runner's local daemon rather than pushed straight
+      # out, and the runner is long-lived — without this every run strands a full image
+      # and the disk fills. Safe to drop: the deploy pulls from the registry, and
+      # no-cache is on anyway, so nothing here would have been reused.
+      - name: Remove locally built image
+        if: always()
+        run: |
+          docker rmi -f "${{ vars.IMAGE_NAME }}:${{ github.sha }}" >/dev/null 2>&1 || true
+          docker rmi -f "${{ vars.IMAGE_NAME }}:latest" >/dev/null 2>&1 || true
+          echo "Local image tags removed from the runner."
+
       - name: Deployment Summary
         if: always()
         run: |
@@ -184,11 +310,21 @@ jobs:
           echo "| **Branch** | \`${{ github.ref_name }}\` |" >> "$GITHUB_STEP_SUMMARY"
           echo "| **Commit** | [\`${GITHUB_SHA::7}\`](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}) |" >> "$GITHUB_STEP_SUMMARY"
           echo "| **Triggered by** | ${{ github.actor }} |" >> "$GITHUB_STEP_SUMMARY"
-          if [ "${{ steps.deploy.outcome }}" == "success" ]; then
-            echo "| **Webhook** | Triggered |" >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "| **Webhook** | Failed |" >> "$GITHUB_STEP_SUMMARY"
-          fi
+          case "${{ steps.tests.outcome }}" in
+            success) echo "| **Tests** | Passed |" >> "$GITHUB_STEP_SUMMARY" ;;
+            skipped) echo "| **Tests** | Skipped |" >> "$GITHUB_STEP_SUMMARY" ;;
+            *)       echo "| **Tests** | Failed — nothing pushed or deployed |" >> "$GITHUB_STEP_SUMMARY" ;;
+          esac
+          case "${{ steps.push.outcome }}" in
+            success) echo "| **Registry push** | Pushed \`:${GITHUB_SHA::7}\` and \`:latest\` |" >> "$GITHUB_STEP_SUMMARY" ;;
+            skipped) echo "| **Registry push** | Skipped (not master) |" >> "$GITHUB_STEP_SUMMARY" ;;
+            *)       echo "| **Registry push** | Failed |" >> "$GITHUB_STEP_SUMMARY" ;;
+          esac
+          case "${{ steps.deploy.outcome }}" in
+            success) echo "| **Webhook** | Triggered |" >> "$GITHUB_STEP_SUMMARY" ;;
+            skipped) echo "| **Webhook** | Skipped |" >> "$GITHUB_STEP_SUMMARY" ;;
+            *)       echo "| **Webhook** | Failed |" >> "$GITHUB_STEP_SUMMARY" ;;
+          esac
           if [ "${{ steps.verify.outcome }}" == "success" ]; then
             echo "| **Health Check** | Healthy |" >> "$GITHUB_STEP_SUMMARY"
           elif [ "${{ steps.verify.outcome }}" == "skipped" ]; then
