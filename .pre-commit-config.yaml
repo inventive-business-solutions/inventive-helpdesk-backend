@@ -46,23 +46,6 @@ repos:
             )$
 
 
-  - repo: https://github.com/pre-commit/mirrors-eslint
-    rev: v8.44.0
-    hooks:
-      - id: eslint
-        types_or: [javascript]
-        args: ['--quiet']
-        # Ignore any files that might contain jinja / bundles
-        exclude: |
-            (?x)^(
-                inventive_helpdesk_backend/public/dist/.*|
-                cypress/.*|
-                .*node_modules.*|
-                .*boilerplate.*|
-                inventive_helpdesk_backend/templates/includes/.*|
-                inventive_helpdesk_backend/public/js/lib/.*
-            )$
-
 ci:
     autoupdate_schedule: weekly
     skip: []

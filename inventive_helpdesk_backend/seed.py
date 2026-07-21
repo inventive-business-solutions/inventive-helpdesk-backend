@@ -1,6 +1,9 @@
-"""Seed the Inventive Helpdesk demo data (mirrors web/data/mock.ts). Idempotent.
+"""Seed the Inventive Helpdesk demo data. Idempotent.
 
-Run: bench --site inventive.localhost execute inventive_helpdesk_backend.seed.run
+Creates demo users with fixed passwords, so it refuses to run unless the site has
+developer_mode enabled.
+
+Run: bench --site helpdesk.localhost execute inventive_helpdesk_backend.seed.run
 """
 import datetime
 import frappe
