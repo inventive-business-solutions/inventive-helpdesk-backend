@@ -105,12 +105,13 @@ jobs:
           secret-files: |
             apps_json=builds/apps.json
 
-      # VERSION is passed as a query parameter, which Portainer applies as a stack
-      # environment variable for this redeploy. That matters on Community Edition:
-      # "Re-pull image" and "Force redeployment" are Business features, so a webhook
-      # that redeployed :latest could reuse the locally cached image and silently
-      # keep serving old code. Deploying an immutable :<sha> tag is a genuinely
-      # different image reference, so Swarm has to pull it.
+      # The stack's VERSION must be "latest" (not a pinned SHA). This webhook only
+      # re-pulls the git repo and redeploys — it does not set environment variables,
+      # and a ?VERSION= query parameter is silently ignored on Community Edition.
+      # Because docker stack deploy re-resolves a tag to its current registry digest,
+      # redeploying :latest picks up the image this run just pushed. Pinning VERSION
+      # to a SHA makes every redeploy faithfully reinstall that same old image.
+      # Each build is also tagged :<sha>, so rollback is still a VERSION change.
       - name: Deploy to Server
         id: deploy
         if: success()
@@ -121,13 +122,13 @@ jobs:
             echo "::notice::PORTAINER_WEBHOOK_URL not set — skipping deploy. Release manually in Portainer."
             exit 0
           fi
-          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "${WEBHOOK_URL}?VERSION=${{ github.sha }}")
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$WEBHOOK_URL")
           echo "status_code=$HTTP_CODE" >> "$GITHUB_OUTPUT"
           if [ "$HTTP_CODE" -ne 204 ] && [ "$HTTP_CODE" -ne 200 ]; then
             echo "::error::Deployment webhook failed with HTTP $HTTP_CODE"
             exit 1
           fi
-          echo "Deployment triggered (HTTP $HTTP_CODE) for VERSION=${{ github.sha }}"
+          echo "Deployment triggered (HTTP $HTTP_CODE)"
 
       # Compares the running container's stamped build_sha against this commit. A plain
       # HTTP 200 check would pass against the previous container still serving traffic.

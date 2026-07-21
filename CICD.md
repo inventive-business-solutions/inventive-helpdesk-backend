@@ -41,15 +41,21 @@ Docker Swarm
        └── migration service: bench --site all migrate
 ```
 
-**CI builds; deploys are manual.** Portainer CE has no stack webhook (Business Edition
-only), and its polling alternative triggers on the git commit rather than the image
-push — so it can redeploy before the new image has finished uploading, and will not
-retry for that commit. Rather than risk a silently stale deploy behind a green
-pipeline, releases are a deliberate click in Portainer.
+**The stack's `VERSION` must be `latest`.** This is the single setting the whole deploy
+chain depends on, and getting it wrong fails silently.
 
-If deploys become frequent enough to be annoying, the Portainer REST API
-(`PUT /api/stacks/{id}/git/redeploy?endpointId={envId}`, header `X-API-Key`) works on
-CE and can be called from the workflow after the push step.
+The webhook available on Community Edition only re-pulls the git repository and
+redeploys — it does not set environment variables (a `?VERSION=` query parameter is
+accepted and then ignored), and it cannot force an image pull, since *Re-pull image*
+and *Force redeployment* are Business features.
+
+What makes it work anyway: `docker stack deploy` re-resolves an image tag to its
+current registry digest, so redeploying `:latest` picks up whatever CI last pushed.
+
+Pin `VERSION` to a SHA and every redeploy faithfully reinstalls that same image
+forever — the pipeline goes green, the webhook returns 204, the containers restart,
+and the old code keeps serving. Every build is also tagged `:<sha>`, so pinning one
+deliberately is still how you roll back.
 
 Build args pin the stack to match local dev: Frappe `version-16`, Python `3.14.0`,
 Node `24.1.0`.
