@@ -4,7 +4,7 @@
 import json
 
 import frappe
-from frappe.tests.utils import FrappeTestCase
+from frappe.tests import IntegrationTestCase
 
 from inventive_helpdesk_backend.api import add_message, add_note
 
@@ -75,7 +75,7 @@ def make_group(name: str) -> str:
     return name
 
 
-class TestSupportTicket(FrappeTestCase):
+class TestSupportTicket(IntegrationTestCase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()

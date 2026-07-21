@@ -2,7 +2,7 @@
 # See license.txt
 
 import frappe
-from frappe.tests.utils import FrappeTestCase
+from frappe.tests import IntegrationTestCase
 
 
 def _make_user(email, roles):
@@ -28,7 +28,7 @@ def _make_member(name, email, user):
 	}).insert(ignore_permissions=True)
 
 
-class TestTeamMember(FrappeTestCase):
+class TestTeamMember(IntegrationTestCase):
 	def test_deleting_member_disables_linked_login(self):
 		email = "orphan.member@example.com"
 		user = _make_user(email, ["Support Team"])

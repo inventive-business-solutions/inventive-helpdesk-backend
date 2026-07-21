@@ -2,10 +2,10 @@
 # See license.txt
 
 import frappe
-from frappe.tests.utils import FrappeTestCase
+from frappe.tests import IntegrationTestCase
 
 
-class TestPOC(FrappeTestCase):
+class TestPOC(IntegrationTestCase):
     def test_division_must_belong_to_client(self):
         # Tenant isolation scopes portal users by POC.division — a POC pointing at
         # another client's division would leak that client's tickets.

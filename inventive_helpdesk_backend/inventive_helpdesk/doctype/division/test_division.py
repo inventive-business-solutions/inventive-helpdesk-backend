@@ -2,7 +2,7 @@
 # See license.txt
 
 import frappe
-from frappe.tests.utils import FrappeTestCase
+from frappe.tests import IntegrationTestCase
 
 from inventive_helpdesk_backend.constants import MAX_CODE_LEN
 
@@ -17,7 +17,7 @@ def _client() -> str:
     return FIXTURE_CLIENT
 
 
-class TestDivision(FrappeTestCase):
+class TestDivision(IntegrationTestCase):
     def test_code_over_max_length_rejected(self):
         # Mirrors Client.client_code — division_code is the right half of Support
         # Ticket's tabSeries key, so it must respect the same bound.
