@@ -98,11 +98,21 @@ Division       -> permissions.division_query
 **`has_permission`** — per-document checks, for direct access by name:
 
 ```
-Support Ticket -> ticket_has_permission
-Client         -> client_has_permission  + manager_write_gate
-Division       -> division_has_permission + manager_write_gate
-POC            -> manager_write_gate
+Support Ticket   -> ticket_has_permission
+Client           -> client_has_permission   + manager_write_gate
+Division         -> division_has_permission + manager_write_gate
+POC              -> manager_write_gate
+Product          -> manager_write_gate
+Team Member      -> manager_write_gate
+Assignment Group -> manager_write_gate
 ```
+
+`manager_write_gate` covers **all six** org masters, not just the tenant-scoped ones.
+That matters because the DocPerms grant Support Team full CRUD on every master — the gate
+is the only thing stopping an agent creating or deleting Products, Team Members and
+Assignment Groups. The manager-only API endpoints are not the enforcement point: a client
+of this backend can reach the same doctypes through `/api/resource/*`, bypassing them
+entirely, so the check has to live in the permission layer.
 
 Both layers matter. The query conditions stop a client seeing others' rows in a list;
 `has_permission` stops them fetching one by guessing its name. `manager_write_gate` is
