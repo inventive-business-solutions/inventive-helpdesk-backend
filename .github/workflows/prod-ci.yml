@@ -1,0 +1,137 @@
+name: INVENTIVE HELPDESK BACKEND CI PIPELINE - PROD
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  BUILD_PROD:
+    runs-on: [self-hosted, dev-arm64]
+    environment: Production
+
+    steps:
+      - name: Checkout Main Repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU for cross-platform builds
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker-container
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Checkout Frappe Docker Repository
+        uses: actions/checkout@v4
+        with:
+          repository: frappe/frappe_docker
+          path: builds
+
+      # APPS_JSON_BASE64 carries a PAT, so it lives in secrets (not vars) to keep it
+      # masked in run logs. Piped via env rather than inlined into the run script so
+      # the value never appears in the rendered command.
+      - name: Export apps.json from base64
+        env:
+          APPS_JSON_BASE64: ${{ secrets.APPS_JSON_BASE64 }}
+        run: printf '%s' "$APPS_JSON_BASE64" | base64 -d > builds/apps.json
+
+      - name: Build and Push ARM64 Docker Image
+        uses: docker/build-push-action@v6
+        with:
+          context: builds
+          file: builds/images/custom/Containerfile
+          push: true
+          tags: |
+            ${{ vars.IMAGE_NAME }}:${{ github.sha }}
+            ${{ vars.IMAGE_NAME }}:latest
+          platforms: linux/arm64
+          build-args: |
+            FRAPPE_PATH=https://github.com/frappe/frappe
+            FRAPPE_BRANCH=version-16
+            PYTHON_VERSION=3.14.0
+            NODE_VERSION=24.1.0
+          secret-files: |
+            apps_json=builds/apps.json
+
+      - name: Deploy to Server
+        id: deploy
+        if: success()
+        run: |
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST ${{ secrets.PORTAINER_WEBHOOK_URL }})
+          echo "status_code=$HTTP_CODE" >> $GITHUB_OUTPUT
+          if [ "$HTTP_CODE" -ne 204 ] && [ "$HTTP_CODE" -ne 200 ]; then
+            echo "::error::Deployment webhook failed with HTTP $HTTP_CODE"
+            exit 1
+          fi
+          echo "Deployment triggered successfully (HTTP $HTTP_CODE)"
+
+      # Polls /api/method/ping rather than /: it is guest-callable and proves the
+      # Python app is actually serving, not just that nginx is up and returning a
+      # static page. Returns {"message":"pong"}.
+      - name: Verify Deployment
+        id: verify
+        if: steps.deploy.outcome == 'success'
+        run: |
+          SITE_URL="https://${{ vars.SITE_NAME }}/api/method/ping"
+          echo "Waiting for Portainer to pull image and restart container..."
+          sleep 60
+
+          MAX_ATTEMPTS=12
+          WAIT_SECONDS=15
+
+          for i in $(seq 1 $MAX_ATTEMPTS); do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$SITE_URL")
+            if [ "$HTTP_CODE" -eq 200 ]; then
+              echo "Application is live (HTTP $HTTP_CODE) after attempt $i"
+              echo "status=healthy" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            echo "Attempt $i/$MAX_ATTEMPTS: HTTP $HTTP_CODE - waiting ${WAIT_SECONDS}s..."
+            sleep $WAIT_SECONDS
+          done
+
+          echo "::error::Application did not return HTTP 200 after $MAX_ATTEMPTS attempts"
+          echo "status=unhealthy" >> $GITHUB_OUTPUT
+          exit 1
+
+      - name: Deployment Summary
+        if: always()
+        run: |
+          echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Detail | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Environment** | Production |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Image** | \`${{ vars.IMAGE_NAME }}:${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Branch** | \`${{ github.ref_name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Commit** | [\`${GITHUB_SHA::7}\`](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}) |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Triggered by** | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.deploy.outcome }}" == "success" ]; then
+            echo "| **Webhook** | Triggered |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| **Webhook** | Failed |" >> $GITHUB_STEP_SUMMARY
+          fi
+          if [ "${{ steps.verify.outcome }}" == "success" ]; then
+            echo "| **Health Check** | Healthy |" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ steps.verify.outcome }}" == "skipped" ]; then
+            echo "| **Health Check** | Skipped |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| **Health Check** | Unhealthy |" >> $GITHUB_STEP_SUMMARY
+          fi
