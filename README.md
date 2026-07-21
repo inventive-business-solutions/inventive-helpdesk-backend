@@ -12,6 +12,11 @@
 - **Email intake** — inbound email is turned into tickets and replies; clients are auto-acknowledged and notified on client-facing status changes.
 - **Realtime updates** — live ticket changes pushed to the owner, team, and collaborators.
 
+## Documentation
+
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — data model, roles and permission enforcement, hooks, HTTP API, ticket numbering, invites.
+- [CICD.md](CICD.md) — build pipeline, Portainer/Swarm deployment, first-deploy sequence, rollback.
+
 ## Requirements
 
 - Frappe **v16**
