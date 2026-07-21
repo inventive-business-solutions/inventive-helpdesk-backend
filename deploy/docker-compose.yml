@@ -5,14 +5,29 @@ services:
   backend:
     <<: *custom_image
     environment:
-      # Makes Frappe wrap the WSGI app in Werkzeug's ProxyFix, so it reads the real
-      # scheme from X-Forwarded-Proto instead of the plain HTTP it receives from
-      # Traefik. Without it `frappe.local.request.scheme` is "http", and
-      # CookieManager.set_cookie derives `secure` from exactly that — so the session
-      # cookie ships without the Secure flag on an HTTPS-only site.
-      # See frappe/app.py (`if proxy or os.environ.get("USE_PROXY")`) and
-      # frappe/auth.py (`secure = frappe.local.request.scheme == "https"`).
-      USE_PROXY: "1"
+      # Lets gunicorn trust the X-Forwarded-* headers nginx sends it, which is what
+      # gives the session cookie its Secure flag.
+      #
+      # The chain is Traefik --https--> nginx --http--> gunicorn --> Frappe. Frappe
+      # sets the flag from one expression (frappe/auth.py):
+      #     secure = frappe.local.request.scheme == "https"
+      # and there is no config option to force it. So request.scheme has to be right.
+      #
+      # nginx already cooperates: /etc/nginx/conf.d/frappe.conf maps
+      # $http_x_forwarded_proto through, preserving Traefik's "https" rather than
+      # overwriting it with $scheme. But gunicorn only honours X-Forwarded-* from
+      # peers listed in forwarded_allow_ips, which defaults to 127.0.0.1 — and on
+      # Swarm nginx reaches this container from an overlay address (10.0.x.x), so
+      # gunicorn discarded the header and reported the scheme as plain http.
+      #
+      # "*" is safe here: this service publishes no ports and is reachable only on
+      # the internal overlay networks below, so nothing outside the stack can reach
+      # gunicorn to spoof the header.
+      #
+      # NB: USE_PROXY (Frappe's own ProxyFix switch) does NOT work here. It is only
+      # applied inside frappe/app.py's serve(), the `bench serve` dev server; gunicorn
+      # imports frappe.app:application directly and never runs that code path.
+      FORWARDED_ALLOW_IPS: "*"
     deploy:
       restart_policy:
         condition: on-failure
