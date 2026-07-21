@@ -7,7 +7,7 @@ app_name = "inventive_helpdesk_backend"
 app_title = "Inventive Helpdesk"
 app_publisher = "Inventive Business Solutions Pvt Ltd"
 app_description = "After-sales support and ticketing for Inventive Business Solutions"
-app_email = "support@inventive.io"
+app_email = "helpdesk@inventivebizsol.com"
 app_license = "mit"
 
 # --- Inventive Helpdesk: install/migrate ---

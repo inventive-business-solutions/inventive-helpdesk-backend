@@ -181,7 +181,7 @@ def send_test_email(from_email, subject=None, body=None, from_name=None):
     sender = (from_email or "").strip()
     if not sender:
         frappe.throw("A sender email address is required")
-    to = _support_inbox() or "support@inventivebizsol.com"
+    to = _support_inbox() or "helpdesk@inventivebizsol.com"
     base = (frappe.conf.get("mailpit_api") or "http://localhost:8025").rstrip("/")
     payload = {
         "From": {"Email": sender, "Name": (from_name or "").strip() or sender},

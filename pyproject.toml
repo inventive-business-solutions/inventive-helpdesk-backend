@@ -1,7 +1,7 @@
 [project]
 name = "inventive_helpdesk_backend"
 authors = [
-    { name = "Inventive Business Solutions Pvt Ltd", email = "support@inventive.io"}
+    { name = "Inventive Business Solutions Pvt Ltd", email = "helpdesk@inventivebizsol.com"}
 ]
 description = "After-sales support and ticketing for Inventive Business Solutions"
 requires-python = ">=3.14"
