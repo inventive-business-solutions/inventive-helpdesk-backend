@@ -219,7 +219,14 @@ services:
           fi
         done;
         echo "sites/common_site_config.json found";
-        [[ -d "sites/$${SITE_NAME}" ]] && echo "$${SITE_NAME} already exists" && exit 0;
+        if [[ -f "sites/$${SITE_NAME}/site_config.json" ]]; then
+          echo "$${SITE_NAME} already exists";
+          exit 0;
+        fi;
+        if [[ -d "sites/$${SITE_NAME}" ]]; then
+          echo "Removing partial site dir from an earlier failed create (no site_config.json)";
+          rm -rf "sites/$${SITE_NAME}";
+        fi;
         bench new-site --mariadb-user-host-login-scope='%' --admin-password=$${ADMIN_PASSWORD} --db-root-username=root --db-root-password=$${DB_ROOT_PASSWORD} $${INSTALL_APP_ARGS} $${SITE_NAME};
     volumes:
       - sites:/home/frappe/frappe-bench/sites
