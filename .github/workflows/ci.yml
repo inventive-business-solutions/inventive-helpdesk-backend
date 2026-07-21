@@ -32,10 +32,12 @@ jobs:
       - name: Validate required configuration
         env:
           IMAGE_NAME: ${{ vars.IMAGE_NAME }}
+          SITE_NAME: ${{ vars.SITE_NAME }}
           APPS_JSON_BASE64: ${{ secrets.APPS_JSON_BASE64 }}
         run: |
           missing=""
           [ -z "$IMAGE_NAME" ]       && missing="$missing IMAGE_NAME(variable)"
+          [ -z "$SITE_NAME" ]        && missing="$missing SITE_NAME(variable)"
           [ -z "$APPS_JSON_BASE64" ] && missing="$missing APPS_JSON_BASE64(secret)"
           if [ -n "$missing" ]; then
             echo "::error::Missing required config on the Production environment:$missing"
@@ -103,11 +105,63 @@ jobs:
           secret-files: |
             apps_json=builds/apps.json
 
-      # No CD step yet: this stack has no Portainer webhook URL configured. Releasing
-      # is currently a manual "Update the stack" with Re-pull image in Portainer. If a
-      # webhook is available, add a Deploy step posting to it, then a Verify step
-      # polling the health endpoint until build_sha matches github.sha.
-      - name: Build Summary
+      # VERSION is passed as a query parameter, which Portainer applies as a stack
+      # environment variable for this redeploy. That matters on Community Edition:
+      # "Re-pull image" and "Force redeployment" are Business features, so a webhook
+      # that redeployed :latest could reuse the locally cached image and silently
+      # keep serving old code. Deploying an immutable :<sha> tag is a genuinely
+      # different image reference, so Swarm has to pull it.
+      - name: Deploy to Server
+        id: deploy
+        if: success()
+        env:
+          WEBHOOK_URL: ${{ secrets.PORTAINER_WEBHOOK_URL }}
+        run: |
+          if [ -z "$WEBHOOK_URL" ]; then
+            echo "::notice::PORTAINER_WEBHOOK_URL not set — skipping deploy. Release manually in Portainer."
+            exit 0
+          fi
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "${WEBHOOK_URL}?VERSION=${{ github.sha }}")
+          echo "status_code=$HTTP_CODE" >> "$GITHUB_OUTPUT"
+          if [ "$HTTP_CODE" -ne 204 ] && [ "$HTTP_CODE" -ne 200 ]; then
+            echo "::error::Deployment webhook failed with HTTP $HTTP_CODE"
+            exit 1
+          fi
+          echo "Deployment triggered (HTTP $HTTP_CODE) for VERSION=${{ github.sha }}"
+
+      # Compares the running container's stamped build_sha against this commit. A plain
+      # HTTP 200 check would pass against the previous container still serving traffic.
+      - name: Verify Deployment
+        id: verify
+        if: steps.deploy.outcome == 'success'
+        run: |
+          EXPECTED_SHA="${{ github.sha }}"
+          HEALTH_URL="https://${{ vars.SITE_NAME }}/api/method/inventive_helpdesk_backend.health.check"
+          echo "Waiting for container restart..."
+          sleep 60
+
+          MAX_ATTEMPTS=12
+          WAIT_SECONDS=15
+
+          for i in $(seq 1 $MAX_ATTEMPTS); do
+            RESPONSE=$(curl -s --max-time 10 "$HEALTH_URL" || true)
+            DEPLOYED_SHA=$(echo "$RESPONSE" | jq -r '.message.build_sha // empty' 2>/dev/null || true)
+
+            if [ "$DEPLOYED_SHA" = "$EXPECTED_SHA" ]; then
+              echo "Deployment verified — running build $DEPLOYED_SHA"
+              echo "status=healthy" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            echo "Attempt $i/$MAX_ATTEMPTS — deployed: ${DEPLOYED_SHA:-unavailable}, expected: $EXPECTED_SHA. Retrying in ${WAIT_SECONDS}s..."
+            sleep $WAIT_SECONDS
+          done
+
+          echo "::error::Verification failed — $EXPECTED_SHA not live after $MAX_ATTEMPTS attempts"
+          echo "status=unhealthy" >> "$GITHUB_OUTPUT"
+          exit 1
+
+      - name: Deployment Summary
         if: always()
         run: |
           echo "## Build Summary" >> "$GITHUB_STEP_SUMMARY"
@@ -120,6 +174,15 @@ jobs:
           echo "| **Branch** | \`${{ github.ref_name }}\` |" >> "$GITHUB_STEP_SUMMARY"
           echo "| **Commit** | [\`${GITHUB_SHA::7}\`](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}) |" >> "$GITHUB_STEP_SUMMARY"
           echo "| **Triggered by** | ${{ github.actor }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "Image pushed to GHCR. To release it: open the stack in Portainer and" >> "$GITHUB_STEP_SUMMARY"
-          echo "choose **Update the stack** with *Re-pull image* enabled." >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ steps.deploy.outcome }}" == "success" ]; then
+            echo "| **Webhook** | Triggered |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| **Webhook** | Failed |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ "${{ steps.verify.outcome }}" == "success" ]; then
+            echo "| **Health Check** | Healthy |" >> "$GITHUB_STEP_SUMMARY"
+          elif [ "${{ steps.verify.outcome }}" == "skipped" ]; then
+            echo "| **Health Check** | Skipped |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| **Health Check** | Unhealthy |" >> "$GITHUB_STEP_SUMMARY"
+          fi
