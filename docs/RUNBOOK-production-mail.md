@@ -76,9 +76,25 @@ Desk → **Connected App** → New.
 | Client Secret | *the secret **Value**, not the Secret ID* |
 | Scopes | one row: `https://outlook.office365.com/.default` |
 
-Save, then reopen and confirm **Authorization URI** and **Token URI** self-populated from
-the OpenID document. If they are blank the OpenID URL is wrong — fix it before continuing;
-nothing downstream will work.
+Then click **Get OpenID Configuration** (button, top right) and save. That button is what
+fills **Authorization URI** and **Token URI** — they do *not* populate on save. If it errors
+or leaves them blank the OpenID URL is wrong; fix it before continuing, because nothing
+downstream works and the failure resurfaces later disguised as a credential error.
+
+There is **no "Get Access Token" button** in v16. The only other button, *Connect to …*, is
+the browser-based web application flow and is the wrong one for a service principal. To
+prove the credentials on their own, before involving the mailbox:
+
+```
+bench --site <site> console
+>>> frappe.get_doc("Connected App", "Inventive Helpdesk Mail").get_backend_app_token()
+```
+
+A Token Cache object back means secret, tenant, client ID and scope are all correct.
+`AADSTS7000215` means the Secret **ID** was pasted instead of the Secret **Value**.
+
+Do this before step 2. If you skip it and the Email Account fails to save, you cannot tell
+whether the problem is the credentials, the scope, or the mailbox.
 
 > The client-credentials section only appears **after the first save**. That is expected.
 
@@ -97,6 +113,7 @@ Desk → **Email Account** → New.
 | Email Address | `helpdesk@inventivebizsol.com` |
 | Auth Method | **OAuth** |
 | Connected App | the app from step 1 |
+| **Authenticate as Service Principal** | **✓ — mandatory, see below** |
 | Connected User | *leave empty* — client credentials authenticates as the app, not a user |
 | Enable Incoming | ✓ · Use IMAP ✓ · Use SSL ✓ |
 | Email Server | `outlook.office365.com` · port `993` |
@@ -110,7 +127,22 @@ Desk → **Email Account** → New.
 
 Leave **off**: Create Contact, Enable Automatic Linking, Track Email Status, Append To.
 
-Three of those matter and are easy to get wrong:
+Four of those matter and are easy to get wrong:
+
+- **"Authenticate as Service Principal" must be ticked.** This is the one that fails
+  silently. `pull()` skips any OAuth account that has neither this flag nor a user token:
+
+  ```python
+  if (email_account.auth_method == "OAuth"
+      and not email_account.backend_app_flow
+      and not has_token(email_account.connected_app, email_account.connected_user)):
+      continue
+  ```
+
+  (`frappe/email/doctype/email_account/email_account.py:996-1002`.) No error, no log entry —
+  inbound mail simply never arrives, while the account looks correctly configured and the
+  Connected App holds a perfectly valid token. Leaving it unticked also makes **Connected
+  User** appear and behave as required, which pulls you further down the wrong path.
 
 - **Append To empty.** Setting it to Support Ticket hands ticket creation to Frappe's
   `_create_reference_document`, bypassing `_open_ticket_from_email` — and with it the POC
