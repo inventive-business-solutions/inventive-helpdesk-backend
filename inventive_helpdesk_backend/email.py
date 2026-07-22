@@ -16,9 +16,11 @@ All outbound mail is QUEUED (now=False + retry) so a busy mail server can't drop
 addressed to the client (never the support inbox), so it never loops back into a new ticket.
 """
 import json
+import re
 
 import frappe
-from frappe.utils import parse_addr, strip_html
+from frappe.utils import now_datetime, parse_addr, strip_html
+from frappe.utils.html_utils import unescape_html
 
 from inventive_helpdesk_backend.permissions import TEAM_ROLES
 
@@ -61,14 +63,34 @@ def _portal_ticket_url(ticket_name):
     return f"{app_url}/portal/tickets/{ticket_name}" if app_url else ""
 
 
-def _queue_mail(recipient, subject, html, context):
+def _queue_mail(recipient, subject, html, context, ticket=None):
     """Queue a client email (now=False + retry) so a transient failure can't drop it and it
-    can never roll back the ticket action that triggered it. Skips our own support address."""
+    can never roll back the ticket action that triggered it. Skips our own support address.
+
+    `ticket` is what makes replies thread. Frappe stamps the site into every outgoing
+    Message-ID, and on the way back InboundMail.reference_document() finds the Email Queue
+    row whose message_id matches the reply's In-Reply-To header and reuses ITS
+    reference_doctype/reference_name (frappe/email/receive.py:797, :838-867). Without a
+    reference on the way out there is nothing to match, and every client reply opens a
+    duplicate ticket — which is exactly what happened before this argument existed.
+
+    Message-ID threading is used rather than the doctype's email_append_to subject match,
+    because it survives a customer editing the subject line and keeps ticket creation in
+    _open_ticket_from_email rather than handing it to Frappe.
+    """
     recipient = (recipient or "").strip().lower()
     if not recipient or recipient == _support_inbox():
         return
     try:
-        frappe.sendmail(recipients=[recipient], subject=subject, message=html, now=False, retry=3)
+        frappe.sendmail(
+            recipients=[recipient],
+            subject=subject,
+            message=html,
+            reference_doctype="Support Ticket" if ticket else None,
+            reference_name=ticket or None,
+            now=False,
+            retry=3,
+        )
     except (frappe.OutgoingEmailError, frappe.ValidationError):
         frappe.log_error(title=f"{context} email failed")
 
@@ -84,7 +106,9 @@ def _open_ticket_from_email(sender, subject, body):
     doc = frappe.get_doc({
         "doctype": "Support Ticket",
         "title": (subject or "").strip()[:140] or "(no subject)",
-        "description": (strip_html(body or "").strip() or "—")[:100000],
+        # is_reply=False: this mail OPENS the ticket, so there is no prior thread to strip
+        # and a forwarded/quoted body is the customer's actual content.
+        "description": (_clean_body(body, is_reply=False) or "—")[:100000],
         "status": "New",
         "from_email": sender,  # before_insert matches the POC + scopes the ticket
     })
@@ -93,24 +117,204 @@ def _open_ticket_from_email(sender, subject, body):
 
 
 def _backfill_description(ticket, content):
+    """Fill in a ticket's description from the mail that opened it, when it landed empty.
+
+    Same first-contact reasoning as _open_ticket_from_email: this is the ORIGINATING
+    message, so nothing in it is a duplicate of the ticket and quote-stripping can only
+    lose content."""
     if (frappe.db.get_value("Support Ticket", ticket, "description") or "").strip():
         return
-    body = strip_html(content or "").strip()
+    body = _clean_body(content, is_reply=False)
     if body:
         frappe.db.set_value("Support Ticket", ticket, "description", body[:100000], update_modified=False)
 
 
+def _mail_body(doc) -> str:
+    """Raw body of an inbound Communication, best part first.
+
+    `text_content` is the message's plain-text alternative — no tag soup, no entities to
+    unpick, and the quote/signature markers below are all line-anchored, so it reads far
+    more reliably. Virtually every real mail client sends multipart; the HTML part is only
+    the fallback."""
+    return getattr(doc, "text_content", None) or getattr(doc, "content", None) or ""
+
+
+# Where a mail client starts quoting the message being replied to. Everything from the
+# earliest match onwards is the previous thread, which the ticket already holds — keeping
+# it would make a ticket unreadable by the third or fourth reply, each one carrying every
+# message before it.
+_QUOTE_MARKERS = (
+    # "On <date>, <someone> wrote:" — Gmail, Apple Mail, Thunderbird, Yahoo, and the
+    # same shape in other locales. Two things this has to get right:
+    #  - the attribution WRAPS ("...Inventive Helpdesk,\n<helpdesk@...>\nwrote:"), so it
+    #    must span newlines rather than match a single line;
+    #  - it must contain a DATE. Without the \d{1,4} requirement this also fires on
+    #    ordinary prose — "On Monday the engineer said the valve was fine, but in his
+    #    report he wrote: replace it" truncated the message to its first line.
+    re.compile(
+        r"^(?:On|Le|El|Em|Op|Am|Den|På)\s[^\n]{0,60}?\d{1,4}.{0,340}?"
+        r"\b(?:wrote|sent|a écrit|escribió|escreveu|schreef|schrieb|skrev)\b[^:]{0,120}:",
+        re.M | re.S,
+    ),
+    # Lotus Notes: "Helpdesk <h@x.com> wrote on 22/07/2026 18:21:"
+    re.compile(r"^[^\n]{0,120}\bwrote on\s+\d[^\n]{0,60}:\s*$", re.M),
+    re.compile(
+        r"^\s*-{2,}\s*(?:Original Message|Ursprüngliche Nachricht|Message d'origine|"
+        r"Mensaje original|Mensagem original|Oorspronkelijk bericht)\s*-{2,}",
+        re.M | re.I,
+    ),
+    # Forwarded-message banners (Gmail, Apple/Outlook).
+    re.compile(
+        r"^\s*(?:-{2,}\s*)?(?:Forwarded message|Begin forwarded message|"
+        r"Weitergeleitete Nachricht|Message transféré|Mensaje reenviado)\s*[:-]*\s*-*\s*$",
+        re.M | re.I,
+    ),
+    re.compile(r"^[ \t]*(?:_{10,}|-{10,})[ \t]*$", re.M),  # Outlook web / Thunderbird rule
+    # Outlook desktop header block: two consecutive "Header: value" lines. Matched as two
+    # adjacent lines rather than "From: ... <anything> ... To:", because the lazy
+    # `.+?` under re.S that did that restarted a scan to end-of-string at every "From:"
+    # line — 200 KB of mail took 6.5 SECONDS of CPU in a background worker. This form
+    # never scans past one line boundary: 200 KB now takes ~20 ms.
+    re.compile(
+        r"^[ \t]*\*?(?:From|Von|De|Van|Sent|Date|Gesendet|Envoyé|Enviado|Datum|"
+        r"Subject|Betreff|Objet|Asunto|Assunto|To|An|À|Para|Cc)[ \t]*:[ \t]?[^\n]*\n"
+        r"[ \t]*\*?(?:From|Von|De|Van|Sent|Date|Gesendet|Envoyé|Enviado|Datum|"
+        r"Subject|Betreff|Objet|Asunto|Assunto|To|An|À|Para|Cc)[ \t]*:[ \t]?",
+        re.M,
+    ),
+)
+
+# The plain-text quote prefix, anchored to the END of the message. This is deliberately
+# NOT in _QUOTE_MARKERS: as a bare `^\s*>` it cut at the FIRST ">" line anywhere, so a
+# customer pasting a log or a config block lost everything after it —
+#   "The log shows:\n> ERROR 500 at /api/export\nCan you check?"  ->  "The log shows:"
+# losing both the error and the question, on exactly the messages that matter most to a
+# technical support desk. Quoting is only quoting when it runs to the end of the message.
+_QUOTE_TAIL = re.compile(r"\n[ \t]*>[^\n]*(?:\n(?:[ \t]*>[^\n]*|[ \t]*))*$")
+
+
+# Tags that end a visual line. Rewritten to newlines so the markers below, all of which
+# are line-anchored, can see the structure of an HTML-only mail.
+_BLOCK_END = re.compile(
+    r"</(?:div|p|li|tr|h[1-6]|blockquote|table)\s*>|<br\s*/?>|</?(?:div|p|blockquote)\b[^>]*>",
+    re.I,
+)
+# Signature blocks. Only unambiguous markers are cut outright: "-- " on its own line is
+# the RFC 3676 delimiter, and mobile footers are fixed strings. Sign-offs are handled
+# separately below because "Thanks" can legitimately open a sentence.
+_SIGNATURE_MARKERS = (
+    re.compile(r"^-{2,3}\s*$", re.M),  # RFC 3676 "-- ", plus the common broken "---"
+    re.compile(r"^Sent from (?:my|Outlook|Mail for Windows)\b", re.M | re.I),
+    re.compile(r"^Get Outlook for \w+", re.M | re.I),
+    re.compile(r"^(?:Enviado desde mi|Envoyé de mon|Verzonden vanaf mijn)\b", re.M | re.I),
+    re.compile(r"^Von meinem \w+ gesendet", re.M | re.I),
+)
+# A closing line ("Regards," / "Thanks,") followed by only a few short lines — a name,
+# a company, maybe a phone number. Anchored to the END of the message, and capped at five
+# lines of under 60 characters, so a "Thanks," in the middle of a real paragraph and a
+# genuine closing sentence are both left alone.
+_SIGN_OFF = re.compile(
+    r"\n[ \t]*(?:thanks|thank you|regards|best regards|kind regards|warm regards|sincerely|"
+    r"respectfully|cheers|best|yours truly|yours sincerely|mit freundlichen grüßen|"
+    r"cordialement|saludos|atenciosamente)[,.!]?[ \t]*\n"
+    # Each trailing line ends in a mandatory \n; only the last may be unterminated. The
+    # previous `(?:[^\n]{0,60}\n?){0,5}$` made the \n optional inside the repetition,
+    # which is superlinear on a long body.
+    r"(?:[^\n]{0,60}\n){0,5}[^\n]{0,60}\n?$",
+    re.I,
+)
+
+
+def _clean_body(text: str, is_reply: bool = True) -> str:
+    """Plain, quote-free, signature-free text for storing as a message.
+
+    Three things get removed, in order of confidence:
+      1. HTML tags and entities — strip_html only does tags, which is why a raw reply
+         rendered as `&lt;helpdesk@...&gt;`.
+      2. The quoted thread, which the ticket already holds.
+      3. The sender's signature.
+
+    ``is_reply=False`` stops after step 1. On a FIRST-CONTACT mail there is no earlier
+    conversation in the ticket to deduplicate against, so quote-stripping can only destroy
+    content: a customer forwarding a supplier's rejection notice ("---------- Forwarded
+    message ----------" plus the original headers and body) is one of the commonest ways a
+    B2B ticket arrives, and treating that banner as a quote boundary reduces the whole
+    ticket to the banner.
+
+    Deliberately conservative: every rule keeps the text when it isn't confident, and the
+    function never returns empty for non-empty input. Losing a customer's actual question
+    is far worse than leaving a stray "Regards," on the end of it — that is why a message
+    that is nothing but a signature (an early inbound ticket here was exactly that) keeps
+    its body instead of being blanked."""
+    # Turn block boundaries into newlines BEFORE stripping tags. strip_html just deletes
+    # them, which welds the last word of the body onto the first word of the quote
+    # ("I don't knowOn Wed, 22 Jul...") and leaves every line-anchored marker below unable
+    # to match. Only matters when a mail has no plain-text alternative.
+    text = _BLOCK_END.sub("\n", text or "")
+    text = unescape_html(strip_html(text)).replace("\r\n", "\n")
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    if not text or not is_reply:
+        return text
+
+    def cut_at(patterns, s):
+        start = min((m.start() for m in (p.search(s) for p in patterns) if m), default=len(s))
+        return s[:start].rstrip() or s
+
+    text = cut_at(_QUOTE_MARKERS, text)
+    text = _QUOTE_TAIL.sub("", text).rstrip() or text
+    text = cut_at(_SIGNATURE_MARKERS, text)
+    trimmed = _SIGN_OFF.sub("", text).strip()
+    return trimmed or text
+
+
+def _append_client_reply(ticket_name, doc):
+    """Record an inbound reply as a client message on the ticket it belongs to.
+
+    Frappe resolved the reference for us (via the Message-ID on our outgoing mail), so all
+    that's left is to make the reply visible: without this the mail threads onto the right
+    ticket and then sits in Communication where no agent ever sees it.
+
+    Mirrors the row api.add_message writes, so a reply that arrived by email and one typed
+    in the portal are indistinguishable in the thread."""
+    # text_content is the message's plain-text alternative — no tag soup, no entities to
+    # unpick — so prefer it and fall back to the HTML part only when it's absent.
+    body = _clean_body(_mail_body(doc))
+    if not body:
+        return
+    ticket = frappe.get_doc("Support Ticket", ticket_name)
+    # A Communication is only ever inserted once, but a retried pull could in principle
+    # re-deliver the same message; matching on the body keeps that idempotent.
+    if any((r.body or "").strip() == body for r in (ticket.conversation or [])):
+        return
+    sender = (parse_addr(doc.sender or "")[1] or doc.sender or "").strip().lower()
+    ticket.append("conversation", {
+        "kind": "client",
+        "author": (doc.sender_full_name or "").strip() or sender,
+        "role": "Client",
+        "message_on": now_datetime(),
+        "body": body,
+    })
+    # Marks the ticket unread for every agent except whoever posts next (see api.py).
+    ticket.last_activity_on = now_datetime()
+    ticket.save(ignore_permissions=True)
+
+
 def on_communication(doc, method=None):
-    """Real incoming Email Account path. An inbound email becomes a ticket; if Frappe
-    already linked it to a ticket (Email Account 'Append To'), just backfill the body."""
+    """Real incoming Email Account path. An inbound email either continues an existing
+    ticket or opens a new one.
+
+    Frappe has already set reference_doctype/reference_name when the message is a reply to
+    mail we sent (it matches In-Reply-To against our outgoing Email Queue row — see the
+    note in _queue_mail). Anything unreferenced is a fresh conversation."""
     if doc.sent_or_received != "Received":
         return
     if doc.reference_doctype == "Support Ticket" and doc.reference_name:
-        _backfill_description(doc.reference_name, doc.content)
+        _backfill_description(doc.reference_name, _mail_body(doc))
+        _append_client_reply(doc.reference_name, doc)
         return
     if doc.reference_doctype:
         return  # linked to some other doctype — not ours
-    name = _open_ticket_from_email(doc.sender, doc.subject, doc.content)
+    name = _open_ticket_from_email(doc.sender, doc.subject, _mail_body(doc))
     if name:
         doc.db_set("reference_doctype", "Support Ticket", update_modified=False)
         doc.db_set("reference_name", name, update_modified=False)
@@ -220,7 +424,9 @@ def send_ticket_ack(doc, method=None):
     recipient = _ticket_contact_email(doc)
     if recipient:
         subject = f"[{doc.name}] " + ((doc.title or "").strip() or "We've received your request")
-        _queue_mail(recipient, subject, _ack_email_html(doc.name, doc.title), "Ticket acknowledgement")
+        _queue_mail(
+            recipient, subject, _ack_email_html(doc.name, doc.title), "Ticket acknowledgement", doc.name
+        )
 
 
 def notify_client_reply(ticket, body):
@@ -230,7 +436,13 @@ def notify_client_reply(ticket, body):
     if not recipient:
         return
     subject = f"[{ticket.name}] " + ((ticket.title or "").strip() or "Update on your request")
-    _queue_mail(recipient, subject, _reply_email_html(ticket.name, body, _portal_ticket_url(ticket.name)), "Ticket reply")
+    _queue_mail(
+        recipient,
+        subject,
+        _reply_email_html(ticket.name, body, _portal_ticket_url(ticket.name)),
+        "Ticket reply",
+        ticket.name,
+    )
 
 
 # Status changes worth emailing the client about (heading, body message).
@@ -269,6 +481,7 @@ def on_ticket_update(doc, method=None):
         subject,
         _status_email_html(doc.name, heading, message, doc.status, _portal_ticket_url(doc.name)),
         f"Ticket {doc.status} notification",
+        doc.name,
     )
 
 
