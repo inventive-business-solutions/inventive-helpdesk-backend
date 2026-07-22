@@ -88,11 +88,104 @@ def _queue_mail(recipient, subject, html, context, ticket=None):
             message=html,
             reference_doctype="Support Ticket" if ticket else None,
             reference_name=ticket or None,
+            # Ask the recipient's mail system not to answer this with an out-of-office.
+            # That is loop protection at the source: an OOO to a support inbox is what
+            # starts inbound -> ticket -> ack -> OOO -> ticket. Exchange/M365 honours this
+            # header, which covers most correspondents here.
+            #
+            # It has to be an X- header: frappe's add_headers() force-prefixes "X-" onto
+            # any key that lacks it (frappe/email/email_body.py:358), so the RFC 3834
+            # `Auto-Submitted: auto-generated` would be emitted as `X-Auto-Submitted` and
+            # mean nothing to anyone. This one is already X-, so it survives intact.
+            email_headers={"X-Auto-Response-Suppress": "All"},
             now=False,
             retry=3,
         )
     except (frappe.OutgoingEmailError, frappe.ValidationError):
         frappe.log_error(title=f"{context} email failed")
+
+
+# ---- loop protection ------------------------------------------------------
+# Automated mail is the one thing here that can run away. send_ticket_ack fires on every
+# insert carrying a from_email, so a correspondent whose autoresponder strips threading
+# headers gives: inbound -> ticket -> ack -> autoreply -> ticket -> ack, unbounded. On a
+# live M365 tenant that is a weekend's worth of mail and a throttled domain.
+#
+# Two independent guards, because each alone has a gap:
+#   1. Recognise machine-sent mail and refuse to open a ticket from it.
+#   2. Cap acknowledgements per recipient per hour — which bounds the loop whatever
+#      caused it, including causes neither of us predicted.
+_ACK_CAP_PER_HOUR = 4
+
+_AUTO_SENDERS = re.compile(
+    r"^(?:mailer-daemon|postmaster|no-?reply|do-?not-?reply|bounces?)@", re.I
+)
+# Anchored at the start (after any Re:/Fwd: chain) so an ordinary question that merely
+# mentions one of these phrases — "how do I set an out of office?" — is untouched.
+_AUTO_SUBJECTS = re.compile(
+    r"^\s*(?:(?:re|fw|fwd)\s*:\s*)*(?:"
+    r"out of (?:the )?office|automatic reply|auto[- ]?reply|automatic response"
+    r"|undeliverable|undelivered mail|delivery status notification"
+    r"|mail delivery (?:failed|subsystem)|returned mail|delivery has failed|failure notice"
+    r"|abwesenheitsnotiz|automatische antwort"          # de
+    r"|r[ée]ponse automatique|absence du bureau"        # fr
+    r"|respuesta autom[áa]tica|fuera de la oficina"     # es
+    r")",
+    re.I,
+)
+
+
+def _is_auto_generated(sender: str, subject: str) -> bool:
+    """True for out-of-office replies, bounces and other machine-sent mail.
+
+    Header inspection would be more precise — RFC 3834's `Auto-Submitted`, plus
+    `Precedence` and `X-Auto-Response-Suppress` — but Communication stores no raw headers
+    (only message_id/in_reply_to), so by the time on_communication runs they are gone.
+    Sender and subject are what survives, and they cover the shapes that actually reach a
+    support inbox.
+
+    Suppression only stops a TICKET being opened. The Communication row is still written
+    by frappe either way, so no mail is destroyed by a false positive here — it just has
+    to be picked up by hand rather than appearing as a ticket."""
+    sender = (parse_addr(sender or "")[1] or sender or "").strip()
+    return bool(_AUTO_SENDERS.match(sender) or _AUTO_SUBJECTS.match(subject or ""))
+
+
+def _ack_key(recipient: str) -> str:
+    """Redis key for one recipient's ack budget.
+
+    The site is in the key by hand, on purpose. `incr`/`expire` come straight from
+    redis.Redis and act on the RAW key, while frappe's own get_value/set_value/delete_value
+    prefix the site themselves — so mixing the two families silently addresses two
+    different keys. Everything here (and in the tests) goes through this helper and the raw
+    family, so there is one key and it is site-scoped."""
+    return f"helpdesk:ack:{frappe.local.site}:{recipient}"
+
+
+def _ack_allowed(recipient: str) -> bool:
+    """Per-recipient hourly cap on acknowledgements — the backstop that bounds any loop.
+
+    Deliberately counts ACKs only. They are the automatic ones, sent on insert with no
+    human involved; replies and status notifications need an agent to act, so a human is
+    already in that loop. Four an hour is far above what a real correspondent generates
+    (each of their mails is a separate ticket) and far below a runaway."""
+    key = _ack_key(recipient)
+    cache = frappe.cache()
+    count = cache.incr(key)
+    if count == 1:
+        cache.expire(key, 3600)
+    if count > _ACK_CAP_PER_HOUR:
+        # Once per window, not once per message — a loop would otherwise flood Error Log
+        # with the evidence of itself.
+        if count == _ACK_CAP_PER_HOUR + 1:
+            frappe.log_error(
+                message=f"Suppressing acknowledgements to {recipient}: more than "
+                f"{_ACK_CAP_PER_HOUR} in an hour. Likely an autoresponder loop — check "
+                f"recent tickets from this address.",
+                title="Helpdesk ack rate limit tripped",
+            )
+        return False
+    return True
 
 
 # ---- inbound: email → ticket ----------------------------------------------
@@ -102,6 +195,11 @@ def _open_ticket_from_email(sender, subject, body):
     acknowledgement is sent by the Support Ticket after_insert hook, not here."""
     sender = (parse_addr(sender or "")[1] or sender or "").strip().lower()
     if not sender or sender == _support_inbox():
+        return None
+    if _is_auto_generated(sender, subject):
+        # An out-of-office or a bounce is not a support request. Opening a ticket from one
+        # both creates junk AND acks it, which is the first turn of the loop.
+        frappe.logger("helpdesk").info(f"ignored auto-generated mail from {sender}: {subject!r}")
         return None
     doc = frappe.get_doc({
         "doctype": "Support Ticket",
@@ -422,7 +520,7 @@ def send_ticket_ack(doc, method=None):
     if not client_initiated:
         return
     recipient = _ticket_contact_email(doc)
-    if recipient:
+    if recipient and _ack_allowed(recipient):
         subject = f"[{doc.name}] " + ((doc.title or "").strip() or "We've received your request")
         _queue_mail(
             recipient, subject, _ack_email_html(doc.name, doc.title), "Ticket acknowledgement", doc.name

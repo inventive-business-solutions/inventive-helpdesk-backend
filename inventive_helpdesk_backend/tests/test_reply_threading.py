@@ -341,6 +341,87 @@ class TestUnreadMarkers(IntegrationTestCase):
             unread_tickets()
 
 
+class TestLoopProtection(IntegrationTestCase):
+    """Guards the two independent brakes on an autoresponder loop.
+
+    send_ticket_ack fires on every insert carrying a from_email, so a correspondent whose
+    autoresponder strips threading headers gives inbound -> ticket -> ack -> autoreply ->
+    ticket -> ack, without bound. On a live tenant that is a throttled domain.
+    """
+
+    def setUp(self):
+        self._reset_budget()
+
+    def tearDown(self):
+        self._reset_budget()
+
+    @staticmethod
+    def _reset_budget():
+        # Raw `delete`, matching the raw `incr` the limiter uses. frappe's delete_value
+        # would prefix the site a second time and clear a key nothing ever wrote. The
+        # budget also outlives a test run (1h TTL), so it has to be cleared BOTH sides.
+        for who in ("loop.test@example.test", "someone.else@example.test"):
+            frappe.cache().delete(helpdesk_email._ack_key(who))
+
+    # ---- brake 1: don't open a ticket from machine-sent mail ----
+    def test_bounces_and_out_of_office_do_not_open_tickets(self):
+        for sender, subject in (
+            ("MAILER-DAEMON@mail.example.test", "Undeliverable: [INB-0002] Test"),
+            ("postmaster@example.test", "Delivery Status Notification (Failure)"),
+            ("noreply@vendor.test", "Your receipt"),
+            ("real.person@client.test", "Automatic reply: Out of the office"),
+            ("real.person@client.test", "Re: Re: Out of office until 3 August"),
+            ("real.person@client.test", "Abwesenheitsnotiz: Ihre Anfrage"),
+        ):
+            with self.subTest(sender=sender, subject=subject):
+                self.assertTrue(helpdesk_email._is_auto_generated(sender, subject))
+
+    def test_a_real_request_that_merely_mentions_the_phrase_still_opens_a_ticket(self):
+        # The false positive that would cost a customer their ticket. These are anchored
+        # at the start of the subject precisely so a question ABOUT out-of-office is safe.
+        for sender, subject in (
+            ("r.mehta@thermax.test", "How do I set an out of office in the portal?"),
+            ("r.mehta@thermax.test", "Export undeliverable to site B - urgent"),
+            ("r.mehta@thermax.test", "Re: [THX-HTG-0042] Valve symbols mis-detected"),
+            ("Rajesh Mehta <r.mehta@thermax.test>", "Automatic tag validation is failing"),
+        ):
+            with self.subTest(subject=subject):
+                self.assertFalse(helpdesk_email._is_auto_generated(sender, subject))
+
+    def test_an_auto_reply_creates_no_ticket_through_the_real_intake(self):
+        before = frappe.db.count("Support Ticket")
+        name = helpdesk_email._open_ticket_from_email(
+            "MAILER-DAEMON@mail.example.test", "Undeliverable: your message", "delivery failed"
+        )
+        self.assertIsNone(name)
+        self.assertEqual(frappe.db.count("Support Ticket"), before)
+
+    # ---- brake 2: the cap that bounds a loop whatever caused it ----
+    def test_acks_to_one_recipient_are_capped_per_hour(self):
+        who = "loop.test@example.test"
+        allowed = [helpdesk_email._ack_allowed(who) for _ in range(helpdesk_email._ACK_CAP_PER_HOUR + 3)]
+        self.assertEqual(allowed[: helpdesk_email._ACK_CAP_PER_HOUR],
+                         [True] * helpdesk_email._ACK_CAP_PER_HOUR)
+        self.assertEqual(allowed[helpdesk_email._ACK_CAP_PER_HOUR:], [False, False, False],
+                         "the cap has to keep holding, not just trip once")
+
+    def test_the_cap_is_per_recipient(self):
+        # One looping correspondent must not silence acknowledgements for everyone else.
+        for _ in range(helpdesk_email._ACK_CAP_PER_HOUR + 1):
+            helpdesk_email._ack_allowed("loop.test@example.test")
+        self.assertTrue(helpdesk_email._ack_allowed("someone.else@example.test"))
+
+    # ---- outbound: don't provoke the auto-reply in the first place ----
+    def test_outgoing_mail_asks_recipients_not_to_auto_reply(self):
+        captured = {}
+        original = frappe.sendmail
+        frappe.sendmail = lambda **kw: captured.update(kw)
+        try:
+            helpdesk_email._queue_mail("client@example.test", "s", "<p>b</p>", "test", "TKT-0001")
+        finally:
+            frappe.sendmail = original
+        self.assertEqual(captured.get("email_headers"), {"X-Auto-Response-Suppress": "All"})
+
 def _ensure(doctype: str, values: dict) -> str:
     key = {k: v for k, v in values.items() if k in ("client_name", "division_name")}
     existing = frappe.db.get_value(doctype, key)
