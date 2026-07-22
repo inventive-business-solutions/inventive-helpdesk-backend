@@ -169,6 +169,32 @@ In `common_site_config.json` on the production bench:
 "scheduler_interval": 60
 ```
 
+Set them with **`-gp`**, never `-g`:
+
+```
+bench set-config -gp scheduler_tick_interval 60
+bench set-config -gp scheduler_interval 60
+```
+
+`-g` writes the value as a **string**, and `"60"` breaks the scheduler outright:
+
+```python
+"All": f"*/{(frappe.get_conf().scheduler_interval or 240) // 60} * * * *"
+```
+
+`"60" // 60` raises `TypeError`, which kills job-sync — so *every* scheduled job stops,
+inbound mail included, and the only symptom is that nothing happens. `-p` parses the value
+as a number. The stack's own `docker-compose.yml` uses `-gp` for `db_port` and
+`socketio_port` for this reason.
+
+Verify before restarting — the quotes are the whole story:
+
+```
+grep scheduler sites/common_site_config.json
+```
+
+`"scheduler_interval": 60` is correct. `"scheduler_interval": "60"` is broken.
+
 **Both keys.** Frappe v16 reads them from different places — `scheduler_tick_interval`
 drives the tick (`frappe/utils/scheduler.py:264`), while `scheduler_interval` builds the
 cron for `All`-frequency jobs (`scheduled_job_type.py:126`), which is what
