@@ -300,3 +300,104 @@ def _acks_sent_for(ticket_name: str) -> list:
     finally:
         frappe.sendmail, frappe.in_test = original_sendmail, original_in_test
     return sent
+
+
+class TestReplyPolicy(IntegrationTestCase):
+    """Who gets a reply by email, decided server-side.
+
+    The defect this closes: an unregistered sender's ticket could be answered with the
+    email toggle off, so the agent typed a careful reply that reached nobody — there is no
+    portal for that sender to read it in.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.client = _ensure("Client", {"client_name": "Policy Co", "client_code": "PCY"})
+        cls.division = _ensure(
+            "Division", {"division_name": "Policy Div", "division_code": "PDV", "client": cls.client}
+        )
+        _poc(cls.client, cls.division, "policy.registered@example.test", with_login=True)
+        _poc(cls.client, cls.division, "policy.contact@example.test", with_login=False)
+
+    def _ticket(self, from_email):
+        return frappe.get_doc({
+            "doctype": "Support Ticket", "title": "Policy fixture", "description": "x",
+            "ticket_type": "Query", "priority": "Low", "status": "New",
+            "client": self.client, "division": self.division, "from_email": from_email,
+        }).insert(ignore_permissions=True)
+
+    def test_a_sender_with_no_portal_is_always_emailed(self):
+        # The toggle is not offered for these, and is ignored if a REST caller sends it.
+        for addr in ("policy.contact@example.test", "nobody.knows@example.test"):
+            for requested in (None, False, True):
+                with self.subTest(addr=addr, requested=requested):
+                    send, kind, _why = sender.reply_plan(self._ticket(addr), requested_email=requested)
+                    self.assertTrue(send, "replying into a void — this sender has no portal")
+                    self.assertEqual(kind, sender.FORCED)
+
+    def test_a_registered_user_honours_the_toggle_once_they_have_been_told(self):
+        t = self._ticket("policy.registered@example.test")
+        t.db_set("first_response_notified_on", frappe.utils.now_datetime(), update_modified=False)
+        t.reload()
+        self.assertEqual(sender.reply_plan(t, requested_email=True)[0], True)
+        self.assertEqual(sender.reply_plan(t, requested_email=False)[0], False)
+
+    def test_the_first_reply_to_a_registered_user_goes_out_even_with_the_toggle_off(self):
+        # Otherwise it sits unread in a portal they may never have opened.
+        t = self._ticket("policy.registered@example.test")
+        self.assertIsNone(t.first_response_notified_on)
+        send, kind, _why = sender.reply_plan(t, requested_email=False)
+        self.assertTrue(send)
+        self.assertEqual(kind, sender.FIRST_RESPONSE)
+
+    def test_a_no_reply_sender_is_never_emailed(self):
+        for requested in (None, False, True):
+            with self.subTest(requested=requested):
+                send, kind, _why = sender.reply_plan(
+                    self._ticket("noreply@vendor.test"), requested_email=requested
+                )
+                self.assertFalse(send)
+                self.assertEqual(kind, sender.UNREACHABLE)
+
+    def test_add_message_enforces_the_plan_and_stamps_the_first_response(self):
+        """End to end through the whitelisted method, since the rule has to hold against a
+        REST caller and not merely against the UI hiding a toggle."""
+        from inventive_helpdesk_backend.api import add_message
+
+        t = self._ticket("policy.registered@example.test")
+        sent = []
+        original = frappe.sendmail
+        frappe.sendmail = lambda **kw: sent.append(kw)
+        try:
+            # Toggle explicitly OFF — the first reply must still go out.
+            first = add_message(t.name, "We are looking into it.", send_email=0)
+            self.assertTrue(first["emailed"])
+            self.assertEqual(len(sent), 1)
+            t.reload()
+            self.assertIsNotNone(t.first_response_notified_on, "the one-time mail was not recorded")
+
+            # Second reply, toggle still off — now it stays internal to the thread.
+            second = add_message(t.name, "Still investigating.", send_email=0)
+            self.assertFalse(second["emailed"])
+            self.assertEqual(len(sent), 1, "a second mail went out after the client was pointed at the portal")
+        finally:
+            frappe.sendmail = original
+
+    def test_every_outgoing_ticket_email_is_logged(self):
+        from inventive_helpdesk_backend.api import add_message
+
+        t = self._ticket("policy.contact@example.test")
+        original = frappe.sendmail
+        frappe.sendmail = lambda **kw: None
+        try:
+            add_message(t.name, "Emailed because they have no portal.")
+        finally:
+            frappe.sendmail = original
+
+        rows = frappe.get_all(
+            "Ticket Email Log", filters={"ticket": t.name}, fields=["kind", "recipient", "triggered_by"]
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].recipient, "policy.contact@example.test")
+        self.assertEqual(rows[0].kind, "Reply")

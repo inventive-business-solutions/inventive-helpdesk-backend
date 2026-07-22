@@ -174,6 +174,48 @@ def can_receive_email(ticket) -> bool:
     return bool(email) and kind != NO_REPLY
 
 
+# ---- reply policy ---------------------------------------------------------
+# What happens to a staff reply, decided in one place. Each value is also the `kind`
+# recorded in Ticket Email Log, so the audit trail says WHY a mail went out.
+FORCED = "Reply"  # no portal exists for them — email is the only channel
+REQUESTED = "Reply"  # the agent asked for it
+FIRST_RESPONSE = "First Response"  # one-time, sent even though the toggle was off
+INTERNAL = None  # saved to the thread, not emailed
+UNREACHABLE = "unreachable"  # nothing we send would be read
+
+
+def reply_plan(ticket, *, requested_email: bool | None):
+    """Decide whether a staff reply is emailed. Returns (send, kind, explanation).
+
+    Enforced server-side rather than by the frontend hiding a toggle: the rule that an
+    unregistered sender's ticket cannot be answered internal-only has to hold against a
+    REST caller too, the same way _clamp_client_authored_fields does.
+
+    `requested_email` is the toggle, and it is only consulted for a registered user. For
+    everyone else there is no portal to read the reply in, so honouring an "off" toggle
+    would mean the agent replies into a void — which is the actual defect this phase fixes.
+    """
+    kind, address, no_reply = classify(ticket)
+
+    if not address:
+        return False, UNREACHABLE, "no contact address on this ticket"
+    if kind == NO_REPLY:
+        return False, UNREACHABLE, no_reply or "an unmonitored mailbox"
+
+    if kind in (UNREGISTERED, KNOWN_CONTACT):
+        return True, FORCED, f"{address} has no portal access — email is the only channel"
+
+    # Registered: the toggle applies.
+    if requested_email:
+        return True, REQUESTED, f"emailed to {address} as requested"
+    if not getattr(ticket, "first_response_notified_on", None):
+        # The exception in the spec. Their first reply would otherwise sit unread in a
+        # portal they may never have opened, so it goes out once — with a pointer telling
+        # them where the rest of the conversation lives. Only once.
+        return True, FIRST_RESPONSE, f"first reply on this ticket — emailed to {address} once"
+    return False, INTERNAL, "saved to the thread; the client has already been pointed at the portal"
+
+
 def refresh(ticket_name: str) -> None:
     """Recompute the cached classification for one ticket.
 

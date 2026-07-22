@@ -25,6 +25,7 @@
   "from_email",
   "sender_kind",
   "no_reply_reason",
+  "first_response_notified_on",
   "sec_desc",
   "description",
   "attachments",
@@ -226,6 +227,13 @@
    "read_only": 1,
    "depends_on": "eval:doc.sender_kind=='No Reply'",
    "description": "Which rule or pattern marked this address unmonitored."
+  },
+  {
+   "fieldname": "first_response_notified_on",
+   "fieldtype": "Datetime",
+   "label": "First Response Emailed On",
+   "read_only": 1,
+   "description": "Set the first time a staff reply was emailed to the client. Nullable = the client has never had a reply by email, which is what triggers the one-time notification."
   }
  ],
  "grid_page_length": 50,

@@ -54,7 +54,7 @@ def _portal_ticket_url(ticket_name):
     return f"{app_url}/portal/tickets/{ticket_name}" if app_url else ""
 
 
-def _queue_mail(recipient, subject, html, context, ticket=None):
+def _queue_mail(recipient, subject, html, context, ticket=None, log_kind=None):
     """Queue a client email (now=False + retry) so a transient failure can't drop it and it
     can never roll back the ticket action that triggered it. Skips our own support address.
 
@@ -107,6 +107,34 @@ def _queue_mail(recipient, subject, html, context, ticket=None):
         return
     if ticket:
         _anchor_outgoing(ticket, message_id, recipient, subject, html)
+        _log_outgoing(ticket, message_id, recipient, subject, log_kind or context)
+
+
+def _log_outgoing(ticket, message_id, recipient, subject, kind):
+    """Append-only audit of every email we send about a ticket.
+
+    Not derived from Email Queue on purpose: frappe purges that after 30 days — the same
+    purge that used to break reply threading — so it cannot answer "did we ever actually
+    tell the customer?" about anything older than a month, which is the one question an
+    audit trail exists for.
+
+    Best-effort, like the threading anchor: losing a log row must never cost the mail that
+    already went out or the ticket action that triggered it.
+    """
+    try:
+        frappe.get_doc({
+            "doctype": "Ticket Email Log",
+            "ticket": ticket,
+            "kind": kind if kind in ("Acknowledgement", "Reply", "First Response", "Status") else "Reply",
+            "recipient": recipient,
+            "subject": subject,
+            "message_id": message_id,
+            "triggered_by": frappe.session.user,
+            "queued_on": now_datetime(),
+            "delivery_state": "Queued",
+        }).insert(ignore_permissions=True)
+    except Exception:
+        frappe.log_error(title="Ticket email log write failed")
 
 
 def _anchor_outgoing(ticket, message_id, recipient, subject, html):
@@ -685,24 +713,32 @@ def send_ticket_ack(doc, method=None):
     if recipient and _ack_allowed(recipient):
         subject = f"[{doc.name}] " + ((doc.title or "").strip() or "We've received your request")
         _queue_mail(
-            recipient, subject, _ack_email_html(doc.name, doc.title), "Ticket acknowledgement", doc.name
+            recipient, subject, _ack_email_html(doc.name, doc.title), "Ticket acknowledgement", doc.name,
+            log_kind="Acknowledgement",
         )
 
 
-def notify_client_reply(ticket, body):
-    """Email the client a staff member's client-visible reply, with a portal link to continue.
-    Called from api.add_message when a team member posts to the conversation."""
+def notify_client_reply(ticket, body, kind="Reply"):
+    """Email the client a staff member's client-visible reply.
+
+    `kind` is the plan sender.reply_plan chose, and it does two things: it selects the
+    wording, and it is recorded in Ticket Email Log so the audit trail says WHY this went
+    out. "First Response" is the one-time mail sent even though the agent left the email
+    toggle off — it carries the reply verbatim (the client can already read it in the
+    portal, so there is nothing to withhold) plus an explicit pointer to sign in, because
+    that is the whole reason for sending it.
+    """
     recipient = _ticket_contact_email(ticket)
     if not recipient:
         return
     subject = f"[{ticket.name}] " + ((ticket.title or "").strip() or "Update on your request")
-    _queue_mail(
-        recipient,
-        subject,
-        _reply_email_html(ticket.name, body, _portal_ticket_url(ticket.name)),
-        "Ticket reply",
-        ticket.name,
+    portal = _portal_ticket_url(ticket.name)
+    html = (
+        _first_response_email_html(ticket.name, body, portal)
+        if kind == "First Response"
+        else _reply_email_html(ticket.name, body, portal)
     )
+    _queue_mail(recipient, subject, html, "Ticket reply", ticket.name, log_kind=kind)
 
 
 # Status changes worth emailing the client about (heading, body message).
@@ -742,6 +778,7 @@ def on_ticket_update(doc, method=None):
         _status_email_html(doc.name, heading, message, doc.status, _portal_ticket_url(doc.name)),
         f"Ticket {doc.status} notification",
         doc.name,
+        log_kind="Status",
     )
 
 
@@ -797,6 +834,31 @@ def _reply_email_html(ticket_name, body, portal_url):
     You can add more details or continue the conversation in your portal:
   </p>
   {_portal_button(portal_url, "Reply in the portal")}
+  <p style="font-size:12px;color:#8a90a2;line-height:1.6;margin:0;border-top:1px solid #eceef3;padding-top:14px;">
+    Ticket {ticket_name} · Inventive Helpdesk
+  </p>""".strip())
+
+
+def _first_response_email_html(ticket_name, body, portal_url):
+    """The one-time mail sent when an agent replies with the email toggle off.
+
+    Carries the reply verbatim — it is already in the client-visible thread, so there is
+    nothing to withhold — and then says plainly where the rest of the conversation lives.
+    That pointer is the entire reason this mail exists: without it a registered client has
+    no way to know a portal they may never have opened now has something in it.
+    """
+    reply = frappe.utils.escape_html((body or "").strip()).replace("\n", "<br>") or "(no message)"
+    return _shell(f"""
+  <h2 style="font-size:20px;font-weight:700;margin:0 0 6px;">Our team has replied to {ticket_name}</h2>
+  <div style="background:#f4f5fb;border-left:3px solid #4f46e5;border-radius:6px;padding:12px 16px;margin:14px 0 18px;font-size:14px;line-height:1.6;color:#1e2230;">
+    {reply}
+  </div>
+  <p style="font-size:13.5px;line-height:1.6;color:#464b5c;margin:0 0 16px;">
+    You have an account on our support portal, and that&#39;s where the rest of this
+    conversation will be. Sign in to reply, add details, or follow progress on this ticket —
+    we won&#39;t email every update.
+  </p>
+  {_portal_button(portal_url, "Sign in to your portal")}
   <p style="font-size:12px;color:#8a90a2;line-height:1.6;margin:0;border-top:1px solid #eceef3;padding-top:14px;">
     Ticket {ticket_name} · Inventive Helpdesk
   </p>""".strip())

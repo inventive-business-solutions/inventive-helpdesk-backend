@@ -106,8 +106,14 @@ def me():
 
 
 @frappe.whitelist(methods=["POST"])
-def add_message(ticket: str, body: str, attachments=None):
-    """Append a client-visible message. Allowed for the ticket's client POC or staff."""
+def add_message(ticket: str, body: str, attachments=None, send_email=None):
+    """Append a client-visible message. Allowed for the ticket's client POC or staff.
+
+    `send_email` is the agent's "Send reply over email" toggle, and it is a REQUEST, not an
+    instruction — sender.reply_plan has the final say. It is ignored entirely unless the
+    ticket belongs to a registered user, because everyone else has no portal to read the
+    reply in and switching email off would mean replying into a void.
+    """
     body = (body or "").strip()
     if not body and not attachments:
         frappe.throw(_("Message cannot be empty"))
@@ -125,12 +131,25 @@ def add_message(ticket: str, body: str, attachments=None):
     doc.save(ignore_permissions=True)
     # You are not "unread" on your own message.
     _mark_read(doc.name)
-    # A staff member's client-visible reply → email it to the client with a portal link so
-    # email-only clients see it and can jump back in to continue the conversation.
+    # A staff member's client-visible reply. Whether it also goes out by email is policy,
+    # not a caller decision — see sender.reply_plan.
     if team:
+        from inventive_helpdesk_backend import sender
         from inventive_helpdesk_backend.email import notify_client_reply
-        notify_client_reply(doc, body)
-    return doc.name
+
+        requested = None if send_email is None else bool(cint(send_email))
+        send, kind, why = sender.reply_plan(doc, requested_email=requested)
+        if send:
+            notify_client_reply(doc, body, kind=kind)
+            # Stamp on ANY reply email, not just the one-time notification: the exception
+            # exists because the client has never had a reply by mail, and a forced or
+            # requested one satisfies that just as well.
+            if not doc.first_response_notified_on:
+                doc.db_set("first_response_notified_on", now_datetime(), update_modified=False)
+        # Returned so the UI can tell the agent what actually happened rather than leaving
+        # them to infer it from a toggle they may not have looked at.
+        return {"ticket": doc.name, "emailed": send, "detail": why}
+    return {"ticket": doc.name, "emailed": False, "detail": "client message"}
 
 
 @frappe.whitelist(methods=["POST"])
