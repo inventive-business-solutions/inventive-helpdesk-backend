@@ -186,6 +186,31 @@ queued mail straight to a worker rather than waiting for the next `flush` tick.
 
 ---
 
+## 3b. Confirm `app_url` is set, or no client ever sees a portal link
+
+`_portal_ticket_url` returns an empty string when `app_url` is missing from site config,
+and `_client_cta` then falls back to "just reply to this email" — **for everyone, including
+registered users who do have a login**. Nothing errors and nothing is logged; the portal
+button simply never appears.
+
+```
+bench --site <site> console
+>>> frappe.conf.get("app_url")
+```
+
+Expect the frontend origin, e.g. `https://helpdesk.inventivebizsol.co.in` — not `None`, and
+not the backend's own URL. Set it with:
+
+```
+bench --site <site> set-config app_url https://helpdesk.inventivebizsol.co.in
+```
+
+This is the same gap that failed the first production release: two tests asserted a portal
+link and passed only because the developer's bench had `app_url` while CI's fresh site did
+not.
+
+---
+
 ## 4. Verify, in this order
 
 Stop at the first failure; each step depends on the one before.

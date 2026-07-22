@@ -837,6 +837,10 @@ class TestClientFacingWording(IntegrationTestCase):
         self.division = _ensure(
             "Division", {"division_name": "Wording Div", "division_code": "WDV", "client": self.client}
         )
+        self._app_url = _force_app_url()
+
+    def tearDown(self):
+        _restore_app_url(self._app_url)
 
     def _unregistered_ticket(self):
         return frappe.get_doc({
@@ -896,6 +900,29 @@ class TestClientFacingWording(IntegrationTestCase):
         cta = helpdesk_email._client_cta(t, "Reply in the portal")
         self.assertIn("Reply in the portal", cta)
         self.assertNotIn("There is no account to set up", cta)
+
+
+def _force_app_url(url: str = "https://portal.example.test"):
+    """Pin `app_url` for tests that assert a portal LINK is present.
+
+    `app_url` is site config. A developer bench has it; a freshly created CI site never
+    does, and `_portal_ticket_url` returns "" without it — so `_client_cta` falls back to
+    the reply-by-email line and any "a registered client gets the portal button" assertion
+    fails. That is exactly how these tests broke the production release: green locally,
+    red in CI, on identical code.
+
+    Returns the previous value so tearDown can put it back.
+    """
+    previous = frappe.local.conf.get("app_url")
+    frappe.local.conf.app_url = url
+    return previous
+
+
+def _restore_app_url(previous) -> None:
+    if previous is None:
+        frappe.local.conf.pop("app_url", None)
+    else:
+        frappe.local.conf.app_url = previous
 
 
 def _ensure(doctype: str, values: dict) -> str:

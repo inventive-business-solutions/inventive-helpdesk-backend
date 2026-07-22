@@ -491,6 +491,20 @@ class TestPortalLinksOnlyForPeopleWhoHaveOne(IntegrationTestCase):
         _poc(cls.client, cls.division, "portal.registered@example.test", with_login=True)
         _poc(cls.client, cls.division, "portal.contact@example.test", with_login=False)
 
+    def setUp(self):
+        # `app_url` is site config. A developer bench has one, a fresh CI site does not,
+        # and without it _portal_ticket_url returns "" — so the portal branch below can
+        # never be reached and this test silently asserts the local site_config instead of
+        # the behaviour. Pinned here so the result is the same everywhere.
+        self._app_url = frappe.local.conf.get("app_url")
+        frappe.local.conf.app_url = "https://portal.example.test"
+
+    def tearDown(self):
+        if self._app_url is None:
+            frappe.local.conf.pop("app_url", None)
+        else:
+            frappe.local.conf.app_url = self._app_url
+
     def _ticket(self, from_email):
         return frappe.get_doc({
             "doctype": "Support Ticket", "title": "Portal fixture", "description": "x",
