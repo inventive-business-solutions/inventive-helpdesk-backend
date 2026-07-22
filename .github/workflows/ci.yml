@@ -81,6 +81,28 @@ jobs:
           APPS_JSON_BASE64: ${{ secrets.APPS_JSON_BASE64 }}
         run: printf '%s' "$APPS_JSON_BASE64" | base64 -d > builds/apps.json
 
+      # apps.json pins a BRANCH, and `bench get-app` clones that branch — not the commit
+      # this run is building. So a push to development cloned whatever branch the secret
+      # names, tested THAT, and reported success: every green check on development was
+      # testing different code from the code that was pushed.
+      #
+      # Found on 2026-07-22 the expensive way. Commit 56563fe passed on development and
+      # then failed on master with two genuine test failures, after master had already been
+      # pushed — leaving the frontend deployed against a backend that never moved.
+      #
+      # Rewritten in place so the app under test is the branch actually being built. The
+      # URL carries the PAT, so only branch names are ever printed.
+      - name: Point apps.json at the branch being built
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          jq --arg ref "$REF_NAME" '
+            map(if (.url | test("inventive-helpdesk-backend")) then .branch = $ref else . end)
+          ' builds/apps.json > builds/apps.json.tmp
+          mv builds/apps.json.tmp builds/apps.json
+          echo "Branches to be cloned: $(jq -r '[.[].branch] | join(", ")' builds/apps.json)"
+
       # Built into the runner's local daemon, not pushed. The push happens after the
       # tests below, so nothing untested ever lands in the registry. Still a single
       # build — the later push step reuses this image rather than rebuilding it.
@@ -122,6 +144,33 @@ jobs:
             BUILD_SHA=${{ github.sha }}
           secret-files: |
             apps_json=builds/apps.json
+
+      # The branch rewrite above is the fix; this is the alarm that proves it worked. It has
+      # to exist independently, because build_sha.txt is written from github.sha and so is
+      # incapable of detecting an image built from different source — that is precisely why
+      # the staleness stayed invisible for as long as it did.
+      #
+      # Compared by file CONTENT, not by commit: frappe_docker deletes .git from every app
+      # (images/custom/Containerfile:144), so there is no revision left in the image to read.
+      # build_sha.txt is excluded because the build writes it into this same directory.
+      - name: Verify the image contains this commit's app code
+        env:
+          IMAGE_REF: ${{ vars.IMAGE_NAME }}:${{ github.sha }}
+        run: |
+          set -euo pipefail
+          HASH_CMD='find . -type f \( -name "*.py" -o -name "*.json" \) ! -path "*/__pycache__/*" ! -name "build_sha.txt" | LC_ALL=C sort | xargs sha256sum | sha256sum | cut -d" " -f1'
+
+          EXPECTED=$(cd inventive_helpdesk_backend && eval "$HASH_CMD")
+          ACTUAL=$(docker run --rm --entrypoint bash "$IMAGE_REF" -c \
+            "cd /home/frappe/frappe-bench/apps/inventive_helpdesk_backend/inventive_helpdesk_backend && $HASH_CMD")
+
+          echo "workspace : $EXPECTED"
+          echo "image     : $ACTUAL"
+          if [ "$EXPECTED" != "$ACTUAL" ]; then
+            echo "::error::Image was built from different app code than this commit. The tests below would have verified the wrong thing — refusing to continue."
+            exit 1
+          fi
+          echo "Image matches this commit's app code."
 
       # ============================================================
       # Tests
