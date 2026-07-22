@@ -34,6 +34,23 @@ from documentation. Roughly 30 minutes.
 
 ## 0. Prerequisites
 
+> ### First: turn the mailbox off everywhere else
+>
+> Production and any developer bench would share **one real mailbox**. Each site tracks IMAP
+> UIDs independently, so they do not take turns — they both pull the same message. Every
+> customer email would become **two tickets and two acknowledgements**, one of them sent from
+> a laptop, and the customer cannot tell which is real.
+>
+> Before enabling the account here, on every other bench that has it configured, untick
+> **Enable Incoming** and **Enable Outgoing** on the Email Account. Verify with:
+>
+> ```
+> bench --site <site> console
+> >>> frappe.get_all("Email Account", filters={"enable_incoming": 1}, pluck="name")
+> ```
+>
+> Expect `[]` everywhere except production.
+
 - Someone with **System Manager** on the production site.
 - The Azure **client secret value** for app `89799f0f-fab0-46bb-bd25-9424e61e1b43`.
   Not recorded anywhere in this repo, and it should not be pasted into a chat or a ticket.
@@ -139,6 +156,33 @@ The inbound pull cron needs **nothing done by hand**. The app declares `*/2 * * 
 
 Result, measured locally with Frappe's own `get_next_execution()`: pull every 2 min, flush
 every 1 min — worst case inbound-to-acknowledgement ~3–5 minutes.
+
+### The cron is a ceiling, not a guarantee
+
+`pull()` skips a cycle entirely if the previous pull for that account has not finished:
+
+```python
+job_name = f"pull_from_email_account|{email_account.name}"
+queued_jobs = get_jobs(site=frappe.local.site, key="job_name")[frappe.local.site]
+if job_name not in queued_jobs:
+    enqueue(...)
+```
+
+`get_jobs` counts **queued *and* running** jobs (`background_jobs.py:490`), so a pull that
+overruns the interval silently costs the next tick — no log, no retry, no message. The real
+intake interval is therefore `max(cron, pull duration)`, not the cron.
+
+Seen locally on 2026-07-22: two mails waited **249 s** and **~173 s** against a 120 s cron,
+i.e. one to two skipped cycles.
+
+**So do not shorten the cron before measuring how long a pull actually takes.** If a pull
+against M365 runs 30–90 s, moving to `* * * * *` skips roughly every other tick and buys
+little while doubling IMAP connections. Measure first, in Desk → **RQ Job**, filtering on
+`pull_from_email_account` and comparing `started_at` to `ended_at` over a working day. Change
+the cron only if that number is comfortably under the interval you want.
+
+The outbound half needed no such caution and is already done in code: `_queue_mail` hands each
+queued mail straight to a worker rather than waiting for the next `flush` tick.
 
 ---
 

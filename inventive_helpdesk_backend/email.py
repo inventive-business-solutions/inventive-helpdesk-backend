@@ -82,7 +82,7 @@ def _queue_mail(recipient, subject, html, context, ticket=None, log_kind=None):
     # (receive.py:419), and the anchor has to match the stripped form.
     message_id = get_message_id().strip("<>")
     try:
-        frappe.sendmail(
+        queued = frappe.sendmail(
             recipients=[recipient],
             subject=subject,
             message=html,
@@ -105,6 +105,31 @@ def _queue_mail(recipient, subject, html, context, ticket=None, log_kind=None):
     except (frappe.OutgoingEmailError, frappe.ValidationError):
         frappe.log_error(title=f"{context} email failed")
         return
+    # Hand the queued mail straight to a worker instead of waiting for the next
+    # `frappe.email.queue.flush` tick. Flush is an `All`-frequency job, so with
+    # scheduler_interval at 60 an acknowledgement sat up to a further minute after the
+    # ticket already existed — measured at 58s on INB-0008, and 240s before the interval
+    # was corrected. This is the largest remaining slice of inbound-to-acknowledgement that
+    # is ours to remove.
+    #
+    # Not `now=True` on sendmail above: that runs SMTP inline inside the inbound pull job,
+    # so a slow M365 handshake would stall mail INTAKE for every account, and a send
+    # failure would surface in the middle of ticket creation. Enqueuing keeps SMTP off the
+    # pull path and keeps the retry semantics.
+    #
+    # Racing flush is safe in both directions: EmailQueue.send() returns immediately unless
+    # can_send_now() (email_queue.py:159-167), and flush takes a row lock via
+    # get_doc(for_update=True) (queue.py:150). Whichever gets there first wins; the other
+    # no-ops. after_commit because the row must be committed before a worker looks for it.
+    if queued and getattr(queued, "name", None):
+        try:
+            frappe.enqueue_doc(
+                "Email Queue", queued.name, "send", queue="short", enqueue_after_commit=True
+            )
+        except Exception:
+            # The mail is already queued and flush will still collect it on the next tick.
+            # Losing the fast path must never cost the mail itself.
+            frappe.log_error(title=f"{context} fast-send enqueue failed")
     if ticket:
         _anchor_outgoing(ticket, message_id, recipient, subject, html)
         _log_outgoing(ticket, message_id, recipient, subject, log_kind or context)

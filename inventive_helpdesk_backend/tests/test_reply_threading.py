@@ -86,6 +86,47 @@ class TestReplyThreading(IntegrationTestCase):
         self.assertEqual(anchor[0].reference_doctype, "Support Ticket")
         self.assertEqual(anchor[0].reference_name, t.name)
 
+    def test_the_mail_is_handed_to_a_worker_rather_than_left_for_the_next_flush(self):
+        """The queued mail must not wait for the scheduler's flush tick.
+
+        `frappe.email.queue.flush` is an `All`-frequency job, so at scheduler_interval 60
+        an acknowledgement sat up to a further minute after the ticket already existed —
+        measured at 58s on INB-0008, and 240s before the interval was corrected. Pushing
+        the row to a worker removes that wait without moving SMTP onto the pull path.
+        """
+        sent = frappe._dict(name="EQ-TEST-0001")
+        enqueued = []
+        original_sendmail, original_enqueue = frappe.sendmail, frappe.enqueue_doc
+        frappe.sendmail = lambda **kw: sent
+        frappe.enqueue_doc = lambda *a, **kw: enqueued.append((a, kw))
+        try:
+            helpdesk_email._queue_mail("client@example.test", "subj", "<p>body</p>", "test")
+        finally:
+            frappe.sendmail, frappe.enqueue_doc = original_sendmail, original_enqueue
+
+        self.assertEqual(len(enqueued), 1, "the queued mail was left for the next flush tick")
+        args, kwargs = enqueued[0]
+        self.assertEqual(args[:3], ("Email Queue", "EQ-TEST-0001", "send"))
+        self.assertTrue(
+            kwargs.get("enqueue_after_commit"),
+            "must run after commit — a worker cannot see an uncommitted queue row",
+        )
+
+    def test_a_send_that_cannot_be_enqueued_still_leaves_the_mail_queued(self):
+        """The fast path is an optimisation, never a dependency: if enqueuing fails the
+        mail is already in the queue and flush will still collect it."""
+        original_sendmail, original_enqueue = frappe.sendmail, frappe.enqueue_doc
+        frappe.sendmail = lambda **kw: frappe._dict(name="EQ-TEST-0002")
+
+        def boom(*a, **kw):
+            raise RuntimeError("redis is down")
+
+        frappe.enqueue_doc = boom
+        try:
+            helpdesk_email._queue_mail("client@example.test", "subj", "<p>body</p>", "test")
+        finally:
+            frappe.sendmail, frappe.enqueue_doc = original_sendmail, original_enqueue
+
     def test_a_reply_still_threads_after_the_email_queue_is_purged(self):
         # The actual 30-day scenario, driven through frappe's own resolution chain rather
         # than asserting on our own row: queue a mail, delete EVERY Email Queue row the way
