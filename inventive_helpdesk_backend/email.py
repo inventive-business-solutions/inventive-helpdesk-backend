@@ -21,8 +21,6 @@ from frappe.email.email_body import get_message_id
 from frappe.utils import now_datetime, parse_addr, strip_html
 from frappe.utils.html_utils import unescape_html
 
-from inventive_helpdesk_backend.permissions import TEAM_ROLES
-
 
 # ---- addressing -----------------------------------------------------------
 def _support_inbox():

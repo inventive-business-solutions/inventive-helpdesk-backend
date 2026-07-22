@@ -1,7 +1,17 @@
 # Design — Email Reply Workflow for Tickets
 
-**Status:** proposed, not implemented. D1 and D3 are **resolved**; D2 has a recommendation
-awaiting confirmation (§2).
+**Status:** D1, D2 and D3 are all **resolved**. Phases 1 and 2 are **implemented and in
+production** as of 2026-07-23; Phase 3 is **not started** and remains a proposal.
+
+- **Phase 1 — shipped.** `sender.py` (four sender kinds), `sender_kind` and
+  `no_reply_reason` on Support Ticket, the `No Reply Rule` doctype, and the provenance
+  strip in the ticket UI.
+- **Phase 2 — shipped.** `sender.reply_plan` deciding server-side whether a staff reply is
+  emailed, the `Ticket Email Log` audit trail with its reconciliation job, the
+  "Send reply over email" toggle, and `first_response_notified_on`.
+- **Phase 3 — proposal only.** Outbound attachments, CC capture, Reply/Reply-All, and
+  per-message delivery state. `deliver_reply`, `email_cc`, `is_client_visible` and
+  `reply_to_email` appear below as *proposed* names and do not exist in the source.
 **Scope:** how a team member's reply reaches a customer, and how the UI makes the choice obvious.
 
 ---
