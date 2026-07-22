@@ -679,13 +679,20 @@ class TestLoopProtection(IntegrationTestCase):
         for sender, subject in (
             ("MAILER-DAEMON@mail.example.test", "Undeliverable: [INB-0002] Test"),
             ("postmaster@example.test", "Delivery Status Notification (Failure)"),
-            ("noreply@vendor.test", "Your receipt"),
             ("real.person@client.test", "Automatic reply: Out of the office"),
             ("real.person@client.test", "Re: Re: Out of office until 3 August"),
             ("real.person@client.test", "Abwesenheitsnotiz: Ihre Anfrage"),
         ):
             with self.subTest(sender=sender, subject=subject):
                 self.assertTrue(helpdesk_email._is_auto_generated(sender, subject))
+
+    def test_a_no_reply_sender_does_open_a_ticket(self):
+        """Deliberate reversal. `noreply@` used to be suppressed here alongside the mail
+        daemons, so a vendor's automated notice produced nothing at all. A human may still
+        need to act on it, so it becomes a ticket — classified "No Reply" and badged, with
+        the acknowledgement withheld instead. See tests/test_sender.py."""
+        self.assertFalse(helpdesk_email._is_auto_generated("noreply@vendor.test", "Your receipt"))
+        self.assertFalse(helpdesk_email._is_auto_generated("donotreply@bank.test", "Statement ready"))
 
     def test_a_real_request_that_merely_mentions_the_phrase_still_opens_a_ticket(self):
         # The false positive that would cost a customer their ticket. These are anchored

@@ -7,3 +7,4 @@ inventive_helpdesk_backend.patches.convert_child_timestamps
 # Patches added in this section will be executed after doctypes are migrated
 inventive_helpdesk_backend.patches.disable_orphaned_logins
 inventive_helpdesk_backend.patches.fix_uninvited_member_status
+inventive_helpdesk_backend.patches.backfill_sender_kind

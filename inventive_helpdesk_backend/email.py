@@ -179,9 +179,12 @@ def _anchor_outgoing(ticket, message_id, recipient, subject, html):
 #      caused it, including causes neither of us predicted.
 _ACK_CAP_PER_HOUR = 4
 
-_AUTO_SENDERS = re.compile(
-    r"^(?:mailer-daemon|postmaster|no-?reply|do-?not-?reply|bounces?)@", re.I
-)
+# Only genuine mail-transfer-agent addresses suppress ticket creation. `noreply@` and
+# friends deliberately do NOT: a vendor's automated notice arriving here is still something
+# the team may need to act on, so it becomes a ticket, gets classified `No Reply` by
+# sender.py, and is badged in the UI. What it does not get is an acknowledgement — see
+# send_ticket_ack — because nothing would read it and it may bounce straight back.
+_AUTO_SENDERS = re.compile(r"^(?:mailer-daemon|postmaster)@", re.I)
 # Anchored at the start (after any Re:/Fwd: chain) so an ordinary question that merely
 # mentions one of these phrases — "how do I set an out of office?" — is untouched.
 _AUTO_SUBJECTS = re.compile(
@@ -678,6 +681,13 @@ def send_ticket_ack(doc, method=None):
         doc.owner not in ("Administrator", "Guest") and frappe.db.exists("POC", {"user": doc.owner})
     )
     if not client_initiated:
+        return
+    # An unmonitored mailbox gets no acknowledgement: nobody reads it, and on a live tenant
+    # acking `noreply@` invites a bounce or a loop for zero benefit. The ticket still
+    # exists and still shows in the queue — only the automatic mail is withheld.
+    from inventive_helpdesk_backend import sender
+
+    if not sender.can_receive_email(doc):
         return
     recipient = _ticket_contact_email(doc)
     if recipient and _ack_allowed(recipient):

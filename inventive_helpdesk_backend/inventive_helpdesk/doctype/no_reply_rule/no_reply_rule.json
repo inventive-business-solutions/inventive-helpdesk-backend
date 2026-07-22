@@ -1,0 +1,69 @@
+{
+ "actions": [],
+ "allow_rename": 1,
+ "autoname": "field:pattern",
+ "creation": "2026-07-22 21:00:00.000000",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "pattern",
+  "match_type",
+  "enabled",
+  "note"
+ ],
+ "fields": [
+  {
+   "description": "An address, a local-part prefix, a domain, or a regular expression — see Match Type.",
+   "fieldname": "pattern",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Pattern",
+   "reqd": 1,
+   "unique": 1
+  },
+  {
+   "default": "Prefix",
+   "description": "Exact: the whole address. Prefix: the local part starts with this. Domain: everything at this domain. Regex: matched against the whole address.",
+   "fieldname": "match_type",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Match Type",
+   "options": "Exact\nPrefix\nDomain\nRegex",
+   "reqd": 1
+  },
+  {
+   "default": "1",
+   "fieldname": "enabled",
+   "fieldtype": "Check",
+   "in_list_view": 1,
+   "label": "Enabled"
+  },
+  {
+   "description": "Why this rule exists — shown to nobody but the next person to wonder.",
+   "fieldname": "note",
+   "fieldtype": "Data",
+   "label": "Note"
+  }
+ ],
+ "index_web_pages_for_search": 0,
+ "links": [],
+ "modified": "2026-07-22 21:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Inventive Helpdesk",
+ "name": "No Reply Rule",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "read": 1,
+   "role": "Support Team",
+   "write": 1
+  }
+ ],
+ "row_format": "Dynamic",
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": []
+}

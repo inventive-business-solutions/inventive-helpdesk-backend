@@ -23,6 +23,8 @@
   "col2",
   "source",
   "from_email",
+  "sender_kind",
+  "no_reply_reason",
   "sec_desc",
   "description",
   "attachments",
@@ -133,7 +135,7 @@
    "fieldname": "source",
    "fieldtype": "Select",
    "label": "Source",
-   "options": "Portal\nEmail"
+   "options": "Portal\nEmail\nManual\nAPI"
   },
   {
    "fieldname": "from_email",
@@ -207,6 +209,23 @@
    "options": "Ticket Activity",
    "permlevel": 1,
    "read_only": 1
+  },
+  {
+   "fieldname": "sender_kind",
+   "fieldtype": "Select",
+   "label": "Sender",
+   "options": "\nRegistered\nKnown Contact\nUnregistered\nNo Reply",
+   "read_only": 1,
+   "in_standard_filter": 1,
+   "description": "Derived from the reply address. Cached for list views; sender.classify() is authoritative."
+  },
+  {
+   "fieldname": "no_reply_reason",
+   "fieldtype": "Data",
+   "label": "No Reply Reason",
+   "read_only": 1,
+   "depends_on": "eval:doc.sender_kind=='No Reply'",
+   "description": "Which rule or pattern marked this address unmonitored."
   }
  ],
  "grid_page_length": 50,

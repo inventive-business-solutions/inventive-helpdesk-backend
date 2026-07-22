@@ -596,6 +596,14 @@ def invite_poc(poc):
     doc.invited_on = now_datetime()
     doc.save(ignore_permissions=True)
 
+    # Their existing tickets were classified "Known Contact" — no login, so email-only.
+    # Granting the login changes that answer without touching the tickets themselves, so
+    # the cached column has to be refreshed here or it stays wrong until each ticket is
+    # next saved. Bounded by one contact's tickets.
+    from inventive_helpdesk_backend import sender
+
+    sender.refresh_for_email(doc.email)
+
     return {"user": user.name, "email_sent": _send_invite_mail(user, "POC portal")}
 
 

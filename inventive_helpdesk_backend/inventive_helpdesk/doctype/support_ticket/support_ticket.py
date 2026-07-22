@@ -132,6 +132,11 @@ class SupportTicket(Document):
         without permlevel-1 write. A client POC therefore cannot inject rows through a
         crafted payload, while rows appended here still persist.
         """
+        # Who we are talking to, cached for list views. Derived, so it is recomputed on
+        # every save rather than trusted from the payload — and `sender.classify` stays
+        # authoritative for anything that must be right (see sender.py).
+        self._refresh_sender_kind()
+
         # Bulk/system runs must not manufacture history. in_test is deliberately NOT
         # in this set — the tests assert on exactly this behaviour.
         if frappe.flags.in_install or frappe.flags.in_migrate or frappe.flags.in_import:
@@ -162,6 +167,19 @@ class SupportTicket(Document):
                 "author": author,
                 "acted_on": when,
             })
+
+    def _refresh_sender_kind(self):
+        """Recompute the cached sender classification.
+
+        Import is function-local: sender.py is policy and support_ticket.py is the model,
+        so the dependency only exists at call time and cannot become a cycle if sender.py
+        ever needs to read a ticket.
+        """
+        from inventive_helpdesk_backend import sender
+
+        kind, _email, reason = sender.classify(self)
+        self.sender_kind = kind
+        self.no_reply_reason = reason
 
     def _clamp_client_authored_fields(self):
         """Force safe values on a ticket a client POC creates directly, so a hand-crafted
