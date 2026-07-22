@@ -128,9 +128,14 @@ cycle no matter what.
 
 Then **restart the bench** — the scheduler reads the tick at startup.
 
-Finally, speed up the inbound pull. Desk → **Scheduled Job Type** → find
-`frappe.email.doctype.email_account.email_account.pull` → set **Cron Format** to
-`*/2 * * * *`.
+The inbound pull cron needs **nothing done by hand**. The app declares `*/2 * * * *` in
+`hooks.py`, and `bench migrate` applies it on every deploy.
+
+> Do **not** set it in the Desk UI instead. `sync_jobs → insert_single_event` rewrites
+> `cron_format` from hooks whenever they differ
+> (`scheduled_job_type.py:270-275`), and that runs on every migrate — so a value typed into
+> the UI silently reverts on the next deploy, when nobody is watching. This was found by
+> checking the live value after a migrate and discovering it had gone back to `0/10`.
 
 Result, measured locally with Frappe's own `get_next_execution()`: pull every 2 min, flush
 every 1 min — worst case inbound-to-acknowledgement ~3–5 minutes.

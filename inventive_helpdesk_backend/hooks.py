@@ -69,3 +69,26 @@ doc_events = {
 # --- Inventive Helpdesk: staff onboarding ---
 # Flip an invited Team Member to Active the first time they actually sign in.
 on_login = "inventive_helpdesk_backend.api.activate_member_on_login"
+
+# --- Inventive Helpdesk: inbound mail cadence ---
+# Frappe ships this job at `0/10 * * * *`, which behind the scheduler tick means a customer
+# waits 10-14 minutes for their email to become a ticket, and up to ~20 for the
+# acknowledgement. Two minutes is the difference between "did that go through?" and not.
+#
+# It has to live HERE, not in the Desk UI. sync_jobs -> insert_single_event overwrites
+# cron_format from hooks whenever they differ
+# (frappe/core/doctype/scheduled_job_type/scheduled_job_type.py:270-275), and that runs on
+# every `bench migrate` — so a value set by hand silently reverts on the next deploy, which
+# is exactly when nobody is watching for it. Declared by this app, it survives, because our
+# hooks are merged after frappe's own.
+#
+# The other half of the latency is `scheduler_tick_interval` + `scheduler_interval` in
+# common_site_config.json, which are site config and cannot be shipped in the repo. See
+# docs/RUNBOOK-production-mail.md.
+scheduler_events = {
+    "cron": {
+        "*/2 * * * *": [
+            "frappe.email.doctype.email_account.email_account.pull",
+        ],
+    },
+}
