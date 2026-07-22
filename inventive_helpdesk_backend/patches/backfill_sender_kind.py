@@ -20,14 +20,26 @@ def execute():
         filters={"sender_kind": ["in", [None, ""]]},
         pluck="name",
     )
+    failed = 0
     for name in names:
-        doc = frappe.get_doc("Support Ticket", name)
-        kind, _email, reason = sender.classify(doc)
-        frappe.db.set_value(
-            "Support Ticket",
-            name,
-            {"sender_kind": kind, "no_reply_reason": reason},
-            update_modified=False,
-        )
+        # Per-ticket, because this runs inside `bench migrate` during a deploy. An
+        # unhandled error on one badly-shaped legacy ticket would abort the whole
+        # migration and leave production on the previous image — a cosmetic badge is
+        # never worth a failed release. A skipped ticket just keeps a blank sender_kind
+        # and is retried on the next migrate, since the filter above still matches it.
+        try:
+            doc = frappe.get_doc("Support Ticket", name)
+            kind, _email, reason = sender.classify(doc)
+            frappe.db.set_value(
+                "Support Ticket",
+                name,
+                {"sender_kind": kind, "no_reply_reason": reason},
+                update_modified=False,
+            )
+        except Exception:
+            failed += 1
+            frappe.log_error(title=f"backfill_sender_kind skipped {name}")
     if names:
         frappe.db.commit()
+    if failed:
+        print(f"backfill_sender_kind: {failed} of {len(names)} skipped; see Error Log")
