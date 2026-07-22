@@ -86,7 +86,7 @@ def _member_teams(member: str) -> frozenset:
 # are scoped to their own work — assigned-to-me ∪ tickets-I-raised ∪ the shared triage
 # inbox (unrouted tickets any agent may route) ∪ my teams' queues ∪ tickets I collaborate
 # on (directly or via one of my teams); client POCs stay division-scoped (unchanged).
-def ticket_query(user: str = None) -> str:
+def ticket_query(user: str | None = None) -> str:
     user = user or frappe.session.user
     if _is_manager(user):
         return ""
@@ -120,7 +120,7 @@ def ticket_query(user: str = None) -> str:
     return f"`tabSupport Ticket`.division = {frappe.db.escape(p.division)}"
 
 
-def ticket_has_permission(doc, ptype: str = None, user: str = None) -> bool:
+def ticket_has_permission(doc, ptype: str | None = None, user: str | None = None) -> bool:
     # Mirrors ticket_query for direct get_doc/method reads (query conditions only cover
     # list/report). Frappe requires read to write, so this also gates agent writes.
     user = user or frappe.session.user
@@ -150,7 +150,7 @@ def ticket_has_permission(doc, ptype: str = None, user: str = None) -> bool:
 
 
 # ---- Client ---------------------------------------------------------------
-def client_query(user: str = None) -> str:
+def client_query(user: str | None = None) -> str:
     user = user or frappe.session.user
     if _is_team(user):
         return ""
@@ -160,7 +160,7 @@ def client_query(user: str = None) -> str:
     return f"`tabClient`.name = {frappe.db.escape(p.client)}"
 
 
-def client_has_permission(doc, ptype: str = None, user: str = None) -> bool:
+def client_has_permission(doc, ptype: str | None = None, user: str | None = None) -> bool:
     user = user or frappe.session.user
     if _is_team(user):
         return True
@@ -169,7 +169,7 @@ def client_has_permission(doc, ptype: str = None, user: str = None) -> bool:
 
 
 # ---- Division -------------------------------------------------------------
-def division_query(user: str = None) -> str:
+def division_query(user: str | None = None) -> str:
     user = user or frappe.session.user
     if _is_team(user):
         return ""
@@ -179,7 +179,7 @@ def division_query(user: str = None) -> str:
     return f"`tabDivision`.client = {frappe.db.escape(p.client)}"
 
 
-def division_has_permission(doc, ptype: str = None, user: str = None) -> bool:
+def division_has_permission(doc, ptype: str | None = None, user: str | None = None) -> bool:
     user = user or frappe.session.user
     if _is_team(user):
         return True

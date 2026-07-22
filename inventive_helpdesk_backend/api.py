@@ -20,14 +20,14 @@ from frappe import _
 from frappe.sessions import get_csrf_token
 from frappe.utils import cint, now_datetime
 
-from inventive_helpdesk_backend.permissions import TEAM_ROLES, MANAGER_ROLES
+from inventive_helpdesk_backend.permissions import MANAGER_ROLES, TEAM_ROLES
 
 
-def _is_team(user: str = None) -> bool:
+def _is_team(user: str | None = None) -> bool:
     return bool(set(frappe.get_roles(user or frappe.session.user)) & TEAM_ROLES)
 
 
-def _is_manager(user: str = None) -> bool:
+def _is_manager(user: str | None = None) -> bool:
     return bool(set(frappe.get_roles(user or frappe.session.user)) & MANAGER_ROLES)
 
 

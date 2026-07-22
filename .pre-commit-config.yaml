@@ -17,8 +17,11 @@ repos:
       - id: check-yaml
       - id: debug-statements
 
+  # Must stay >= 0.14: pyproject sets `target-version = "py314"`, which older ruff cannot
+  # parse — v0.8.1 aborted with "TOML parse error", so the hook failed outright rather
+  # than linting anything.
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.8.1
+    rev: v0.15.22
     hooks:
       - id: ruff
         name: "Run ruff import sorter"

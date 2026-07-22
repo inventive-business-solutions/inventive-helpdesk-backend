@@ -50,11 +50,16 @@ ignore = [
     "F403", # can't detect undefined names from * import
     "F405", # can't detect undefined names from * import
     "F722", # syntax error in forward type annotation
+    "RUF003", # ambiguous unicode in comments — we use real set notation (∪) deliberately
     "W191", # indentation contains tabs
 ]
 typing-modules = ["frappe.types.DF"]
 
 [tool.ruff.format]
 quote-style = "double"
-indent-style = "tab"
+# This app is space-indented throughout; the scaffold shipped "tab" (frappe core's own
+# style) and nothing ever ran the formatter to notice. Left as "tab" it is a trap: the
+# ruff-format pre-commit hook would silently rewrite the whole app the first time anyone
+# runs `pre-commit install`, burying real changes in a whitespace diff.
+indent-style = "space"
 docstring-code-format = true
