@@ -9,6 +9,13 @@ on_trash hooks, and a one-time patch closes the historical gap.
 """
 import frappe
 
+# Imported explicitly: `frappe` does not import its own `sessions` submodule, so
+# `frappe.sessions` only resolves if something else happened to import it first. That
+# holds for a web request (frappe.handler pulls it in) but NOT on the bench migrate path
+# — where patches/disable_orphaned_logins.py calls this — so the attribute access would
+# AttributeError the first time a patch actually revoked a login.
+from frappe.sessions import clear_sessions
+
 from inventive_helpdesk_backend.permissions import MANAGER_ROLES
 
 
@@ -50,4 +57,4 @@ def revoke_login_if_orphaned(user, exclude_doctype=None, exclude_name=None):
         updates["reset_password_key"] = ""
     if updates:
         frappe.db.set_value("User", user, updates)
-        frappe.sessions.clear_sessions(user, force=True)
+        clear_sessions(user, force=True)

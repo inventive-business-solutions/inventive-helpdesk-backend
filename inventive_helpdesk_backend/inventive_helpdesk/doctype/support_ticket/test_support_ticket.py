@@ -2,11 +2,15 @@
 # See license.txt
 
 import json
+from unittest.mock import patch
 
 import frappe
 from frappe.tests import IntegrationTestCase
 
 from inventive_helpdesk_backend.api import add_message, add_note
+from inventive_helpdesk_backend.inventive_helpdesk.doctype.support_ticket.support_ticket import (
+    SupportTicket,
+)
 
 # Distinctive fixture names so tests never collide with real/seeded site data.
 CLIENT_A = "_Test IC Client A"
@@ -148,6 +152,31 @@ class TestSupportTicket(IntegrationTestCase):
 
         t2 = make_ticket(client=client_c, division=div_c)
         self.assertEqual(t2.name, "ZTC-GAM-0003")
+
+    def test_autoname_reports_an_exhausted_series_readably(self):
+        # The give-up path calls frappe's `_()` to build its message. When the loop
+        # variable above was also named `_` it shadowed that import, so exhausting the
+        # series raised "'int' object is not callable" — the one path whose whole job is
+        # to explain itself failed unreadably instead. Squeeze the budget to 1 attempt
+        # and park a ticket on the number the series is about to issue, so the collision
+        # is guaranteed and the throw has to fire.
+        client_d = make_client("_Test IC Client D", "ZTD")
+        div_d = make_division(client_d, "Delta", "DEL")
+        # Burn the prefix's first use so the series counter exists — the floor only seeds
+        # on first use, and if it ran here it would simply skip the squatter below.
+        make_ticket(client=client_d, division=div_d)  # ZTD-DEL-0001, series now at 1
+        taken = frappe.get_doc({
+            "doctype": "Support Ticket", "name": "ZTD-DEL-0002", "title": "Squatter",
+            "ticket_type": "Query", "priority": "Medium", "status": "New",
+            "client": client_d, "division": div_d,
+        })
+        taken.flags.name_set = True
+        taken.insert(ignore_permissions=True)
+
+        with patch.object(SupportTicket, "_MAX_NAME_ATTEMPTS", 1):
+            with self.assertRaises(frappe.ValidationError) as caught:
+                make_ticket(client=client_d, division=div_d)
+        self.assertIn("unique ticket number", str(caught.exception))
 
     # ---- server-side validation ----
     def test_division_must_belong_to_client(self):

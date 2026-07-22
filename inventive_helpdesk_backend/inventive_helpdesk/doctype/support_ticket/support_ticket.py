@@ -143,7 +143,12 @@ class SupportTicket(Document):
         # up to an already-taken number. Skip forward past any collision instead of
         # trusting the counter blindly — getseries' FOR UPDATE keeps each pull
         # atomic, so this stays race-safe under concurrent inserts.
-        for _ in range(self._MAX_NAME_ATTEMPTS):
+        # Not `_`: that is frappe's translation function, imported at the top. Binding it
+        # as the loop variable leaves it holding an int once the loop is exhausted, so the
+        # throw below would die with "'int' object is not callable" instead of reporting
+        # the exhausted series — an unreadable failure on the one path that has to explain
+        # itself.
+        for _attempt in range(self._MAX_NAME_ATTEMPTS):
             name = f"{prefix}{getseries(prefix, 4)}"
             if not frappe.db.exists("Support Ticket", name):
                 self.name = name

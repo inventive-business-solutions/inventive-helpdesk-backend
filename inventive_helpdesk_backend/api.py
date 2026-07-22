@@ -17,6 +17,7 @@ import json
 
 import frappe
 from frappe import _
+from frappe.model.rename_doc import rename_doc
 from frappe.sessions import get_csrf_token
 from frappe.utils import cint, now_datetime
 
@@ -381,7 +382,13 @@ def update_poc(name, poc_name=None, email=None, is_primary=None):
         # Keep this LAST (see docstring). No follow-up writes needed: User.after_rename
         # already sets User.email = new, and rename_doc cascades the POC.user Link.
         if linked_user and linked_user != new_email and frappe.db.exists("User", linked_user):
-            frappe.rename_doc("User", linked_user, new_email, force=True, ignore_permissions=True)
+            # The MODULE-level rename_doc, not frappe.rename_doc: the top-level wrapper
+            # (frappe/__init__.py:804) has no ignore_permissions parameter and no **kwargs,
+            # so passing it there is a hard TypeError — this whole branch used to die
+            # before renaming the login. The bypass is needed on purpose: validate_rename
+            # requires write on User, which a Support Manager without System Manager
+            # doesn't have.
+            rename_doc("User", linked_user, new_email, force=True, ignore_permissions=True)
     return name
 
 
