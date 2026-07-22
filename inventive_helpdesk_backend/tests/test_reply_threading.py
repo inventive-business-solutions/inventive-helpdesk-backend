@@ -58,6 +58,72 @@ class TestReplyThreading(IntegrationTestCase):
         self.assertEqual(captured.get("reference_doctype"), "Support Ticket")
         self.assertEqual(captured.get("reference_name"), "TKT-0001")
 
+    def test_outgoing_mail_leaves_a_durable_anchor(self):
+        # The Email Queue row frappe threads on is deleted after 30 days
+        # (frappe/hooks.py:508), so it cannot be the only link back to the ticket. This
+        # Communication is never purged and parent_communication() matches on its
+        # message_id, so it keeps working after the queue row is gone.
+        t = self._ticket()
+        captured = {}
+        original = frappe.sendmail
+        frappe.sendmail = lambda **kw: captured.update(kw)
+        try:
+            helpdesk_email._queue_mail("client@example.test", "subj", "<p>body</p>", "test", t.name)
+        finally:
+            frappe.sendmail = original
+
+        msg_id = captured.get("message_id")
+        self.assertTrue(msg_id, "outgoing mail must carry a message id we control")
+        self.assertNotIn("<", msg_id, "must be stored bare — the inbound side strips brackets")
+
+        anchor = frappe.get_all(
+            "Communication",
+            filters={"message_id": msg_id, "sent_or_received": "Sent"},
+            fields=["reference_doctype", "reference_name"],
+        )
+        self.assertEqual(len(anchor), 1, "no durable anchor was written")
+        self.assertEqual(anchor[0].reference_doctype, "Support Ticket")
+        self.assertEqual(anchor[0].reference_name, t.name)
+
+    def test_a_reply_still_threads_after_the_email_queue_is_purged(self):
+        # The actual 30-day scenario, driven through frappe's own resolution chain rather
+        # than asserting on our own row: queue a mail, delete EVERY Email Queue row the way
+        # the daily cleanup would, then ask frappe what the reply belongs to.
+        from frappe.core.doctype.communication.communication import Communication
+
+        t = self._ticket()
+        captured = {}
+        original = frappe.sendmail
+        frappe.sendmail = lambda **kw: captured.update(kw)
+        try:
+            helpdesk_email._queue_mail("client@example.test", "subj", "<p>body</p>", "test", t.name)
+        finally:
+            frappe.sendmail = original
+        msg_id = captured["message_id"]
+
+        frappe.db.delete("Email Queue")  # what run_log_clean_up does on day 31
+
+        # This is the lookup InboundMail.parent_communication() performs (receive.py:822)
+        # with the reply's In-Reply-To header.
+        parent = Communication.find_one_by_filters(message_id=msg_id, order_by="creation DESC")
+        self.assertTrue(parent, "reply has nothing to thread onto once the queue row is gone")
+        self.assertEqual(parent.reference_doctype, "Support Ticket")
+        self.assertEqual(parent.reference_name, t.name)
+
+    def test_the_anchor_does_not_echo_into_the_conversation(self):
+        # It is a Sent Communication and our own after_insert hook fires on it. If that
+        # hook ever stops ignoring Sent mail, every outbound message would appear in the
+        # client thread twice.
+        t = self._ticket()
+        original = frappe.sendmail
+        frappe.sendmail = lambda **kw: None
+        try:
+            helpdesk_email._queue_mail("client@example.test", "subj", "<p>body</p>", "test", t.name)
+        finally:
+            frappe.sendmail = original
+        t.reload()
+        self.assertEqual(len(t.conversation), 0)
+
     def test_mail_to_the_support_inbox_is_never_sent(self):
         # Loop protection: our own address must never receive our own mail.
         sent = []

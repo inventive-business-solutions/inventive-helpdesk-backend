@@ -19,6 +19,7 @@ import json
 import re
 
 import frappe
+from frappe.email.email_body import get_message_id
 from frappe.utils import now_datetime, parse_addr, strip_html
 from frappe.utils.html_utils import unescape_html
 
@@ -74,6 +75,10 @@ def _queue_mail(recipient, subject, html, context, ticket=None):
     reference on the way out there is nothing to match, and every client reply opens a
     duplicate ticket — which is exactly what happened before this argument existed.
 
+    That Email Queue row is not a durable anchor, though: frappe purges Email Queue after
+    30 days (frappe/hooks.py:508), so `_anchor_outgoing` below writes a second, permanent
+    one. See its docstring.
+
     Message-ID threading is used rather than the doctype's email_append_to subject match,
     because it survives a customer editing the subject line and keeps ticket creation in
     _open_ticket_from_email rather than handing it to Frappe.
@@ -81,11 +86,17 @@ def _queue_mail(recipient, subject, html, context, ticket=None):
     recipient = (recipient or "").strip().lower()
     if not recipient or recipient == _support_inbox():
         return
+    # Generate the id here rather than letting frappe mint one, so the same value can be
+    # written to the durable anchor below. Bare, with no angle brackets: set_message_id
+    # adds them on the way out (email_body.py:337) and the inbound side strips them again
+    # (receive.py:419), and the anchor has to match the stripped form.
+    message_id = get_message_id().strip("<>")
     try:
         frappe.sendmail(
             recipients=[recipient],
             subject=subject,
             message=html,
+            message_id=message_id,
             reference_doctype="Support Ticket" if ticket else None,
             reference_name=ticket or None,
             # Ask the recipient's mail system not to answer this with an out-of-office.
@@ -103,6 +114,59 @@ def _queue_mail(recipient, subject, html, context, ticket=None):
         )
     except (frappe.OutgoingEmailError, frappe.ValidationError):
         frappe.log_error(title=f"{context} email failed")
+        return
+    if ticket:
+        _anchor_outgoing(ticket, message_id, recipient, subject, html)
+
+
+def _anchor_outgoing(ticket, message_id, recipient, subject, html):
+    """Record outgoing mail as a Communication so a reply can still find its ticket after
+    the Email Queue row is gone.
+
+    Threading resolves in order (receive.py:837-867): parent Email Queue row, then parent
+    Communication, then a subject match on the doctype's append_to. Only the first two are
+    available to us — and the first one EXPIRES. `run_log_clean_up` runs in
+    daily_maintenance and deletes Email Queue older than 30 days
+    (frappe/hooks.py:270, :508; email_queue.py:261), and that retention is seeded
+    automatically on a fresh site, so it applies whether or not anyone configured it.
+
+    Without this, threading silently stopped working on day 31: a customer replying to the
+    acknowledgement of a ticket nobody had touched in a month forked a duplicate, exactly
+    as before the reference argument existed. Every outbound mail resets the 30-day clock,
+    so busy tickets were fine and quiet ones were not — the failure mode that is hardest
+    to notice and worst to hit.
+
+    Communication is never purged (it is absent from default_log_clearing_doctypes), and
+    parent_communication() matches on Communication.message_id (receive.py:822), so this
+    row keeps working indefinitely. It costs one row per outbound mail.
+
+    Inserting a Sent Communication does NOT send anything: Communication.after_insert only
+    updates status and fires a realtime notification — there is no send path on insert
+    (frappe/core/doctype/communication/communication.py:190-196). Our own on_communication
+    hook ignores it too, because it returns early on anything not Received."""
+    try:
+        doc = frappe.get_doc({
+            "doctype": "Communication",
+            "communication_type": "Communication",
+            "communication_medium": "Email",
+            "sent_or_received": "Sent",
+            "subject": subject,
+            "content": html,
+            "sender": _support_inbox(),
+            "recipients": recipient,
+            "message_id": message_id,
+            "reference_doctype": "Support Ticket",
+            "reference_name": ticket,
+        })
+        # Keep the stored copy identical to what was sent; frappe would otherwise append
+        # the outgoing account's signature to this record only.
+        doc.flags.skip_add_signature = True
+        doc.insert(ignore_permissions=True)
+    except Exception:
+        # Never let the anchor break the mail that already went out, or the ticket action
+        # that triggered it. Losing one anchor costs threading on that message after 30
+        # days; raising here would cost the whole operation now.
+        frappe.log_error(title="Ticket mail threading anchor failed")
 
 
 # ---- loop protection ------------------------------------------------------
