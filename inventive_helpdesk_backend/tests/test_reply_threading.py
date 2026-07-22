@@ -324,6 +324,124 @@ class TestInboundAttachments(IntegrationTestCase):
         self.assertEqual(len(still_there), 1, "left where frappe put it")
 
 
+class TestBounceHandling(IntegrationTestCase):
+    """A delivery failure belongs on the ticket whose mail failed.
+
+    Before this it did the opposite of useful: MAILER-DAEMON opened a junk ticket, while
+    the ticket that actually failed to reach its customer looked healthy — so the agent
+    believed they had replied when nobody had received anything.
+    """
+
+    def setUp(self):
+        self.client = _ensure("Client", {"client_name": "Bounce Co", "client_code": "BNC"})
+        self.division = _ensure(
+            "Division", {"division_name": "Bounce Div", "division_code": "BDV", "client": self.client}
+        )
+        self.ticket = frappe.get_doc({
+            "doctype": "Support Ticket",
+            "title": "Bounce fixture", "description": "x", "ticket_type": "Query",
+            "priority": "Low", "status": "New",
+            "client": self.client, "division": self.division,
+        }).insert(ignore_permissions=True)
+
+    def _dsn(self, subject, body, sender="MAILER-DAEMON@mail.example.test"):
+        return frappe.get_doc({
+            "doctype": "Communication",
+            "communication_type": "Communication", "communication_medium": "Email",
+            "sent_or_received": "Received", "subject": subject,
+            "sender": sender, "content": body,
+        }).insert(ignore_permissions=True)
+
+    def test_a_bounce_is_filed_on_the_ticket_that_sent_the_mail(self):
+        # Exchange's shape: ticket id in the DSN subject.
+        before = frappe.db.count("Support Ticket")
+        comm = self._dsn(
+            f"Undeliverable: [{self.ticket.name}] Bounce fixture",
+            "Your message couldn't be delivered to r.mehta@thermax.test.\n"
+            "550 5.1.1 The email address you entered couldn't be found.",
+        )
+        helpdesk_email.on_communication(comm)
+
+        self.assertEqual(frappe.db.count("Support Ticket"), before, "a bounce opened a ticket")
+        self.ticket.reload()
+        self.assertEqual(len(self.ticket.notes), 1, "the bounce was dropped instead of filed")
+        note = self.ticket.notes[0].body
+        self.assertIn("Delivery failed", note)
+        self.assertIn("r.mehta@thermax.test", note, "the failed address is what an agent needs")
+        self.assertIn("550", note, "the reason from the DSN should survive")
+        self.assertTrue(self.ticket.last_activity_on, "the team must see the ticket as needing attention")
+
+    def test_the_ticket_id_is_found_in_the_body_when_the_subject_lacks_it(self):
+        # Postfix's shape: generic subject, original subject quoted in the body.
+        comm = self._dsn(
+            "Undelivered Mail Returned to Sender",
+            "This is the mail system at host mx.example.test.\n\n"
+            "<r.mehta@thermax.test>: host mx.thermax.test said: 550 unknown user\n\n"
+            f"Subject: [{self.ticket.name}] Bounce fixture",
+        )
+        helpdesk_email.on_communication(comm)
+        self.ticket.reload()
+        self.assertEqual(len(self.ticket.notes), 1)
+
+    def test_a_bounce_it_cannot_place_still_does_not_open_a_ticket(self):
+        # A bounce is never a support request, so "no ticket" beats "junk ticket" even
+        # when we cannot tell which ticket it came from.
+        before = frappe.db.count("Support Ticket")
+        comm = self._dsn("Undeliverable: some other mail", "550 mailbox unavailable")
+        helpdesk_email.on_communication(comm)
+        self.assertEqual(frappe.db.count("Support Ticket"), before)
+
+    def test_the_same_bounce_twice_is_filed_once(self):
+        subject = f"Undeliverable: [{self.ticket.name}] Bounce fixture"
+        body = "Your message couldn't be delivered to r.mehta@thermax.test. 550 not found."
+        helpdesk_email.on_communication(self._dsn(subject, body))
+        helpdesk_email.on_communication(self._dsn(subject, body))
+        self.ticket.reload()
+        self.assertEqual(len(self.ticket.notes), 1)
+
+    def test_the_bounce_is_staff_only(self):
+        # A customer must not read "we could not reach you" — it is a work note, and work
+        # notes are permlevel 1. Drives the real client read path.
+        from frappe.client import get as client_get
+
+        poc = _poc_for(self.client, self.division, "bounce.poc@example.test")
+        comm = self._dsn(f"Undeliverable: [{self.ticket.name}] x", "550 nope")
+        helpdesk_email.on_communication(comm)
+        self.ticket.reload()
+        self.assertEqual(len(self.ticket.notes), 1)  # guard against a vacuous assertion
+
+        frappe.set_user(poc)
+        try:
+            served = client_get("Support Ticket", self.ticket.name)
+        finally:
+            frappe.set_user("Administrator")
+        self.assertFalse(served.get("notes"), "a delivery failure leaked to the client")
+
+    def test_a_genuine_customer_mail_is_not_mistaken_for_a_bounce(self):
+        """The false positive that costs a customer their ticket.
+
+        This desk's customers talk about shipments and deliveries, so failure words in a
+        subject are ordinary. A bounce needs a daemon sender, or DSN structure in the body
+        to corroborate the subject — neither is present here."""
+        for subject in (
+            "Report is undeliverable to site B - please advise",
+            "Delivery has failed for our shipment, can you check the ticket?",
+            "Returned mail from the courier - who do we contact?",
+            "Undeliverable stock at the Pune warehouse",
+        ):
+            with self.subTest(subject=subject):
+                body = "Please advise, this is blocking the commissioning."
+                self.assertFalse(helpdesk_email._is_bounce("r.mehta@thermax.test", subject, body))
+                self.assertFalse(helpdesk_email._is_auto_generated("r.mehta@thermax.test", subject))
+
+    def test_a_relayed_bounce_still_counts_when_the_body_proves_it(self):
+        # Not every DSN comes from mailer-daemon. A failure subject PLUS real DSN structure
+        # is enough; the subject alone is not.
+        dsn = "Final-Recipient: rfc822; r.mehta@thermax.test\nAction: failed\nStatus: 5.1.1"
+        self.assertTrue(helpdesk_email._is_bounce("relay@corp.example", "Undeliverable: x", dsn))
+        self.assertFalse(helpdesk_email._is_bounce("relay@corp.example", "Undeliverable: x", "hello"))
+
+
 class TestBodyCleaning(IntegrationTestCase):
     """Guards _clean_body: what a customer actually wrote, without the quoted thread or
     their signature.

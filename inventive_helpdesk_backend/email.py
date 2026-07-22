@@ -187,14 +187,16 @@ _AUTO_SENDERS = re.compile(
 _AUTO_SUBJECTS = re.compile(
     r"^\s*(?:(?:re|fw|fwd)\s*:\s*)*(?:"
     r"out of (?:the )?office|automatic reply|auto[- ]?reply|automatic response"
-    r"|undeliverable|undelivered mail|delivery status notification"
-    r"|mail delivery (?:failed|subsystem)|returned mail|delivery has failed|failure notice"
     r"|abwesenheitsnotiz|automatische antwort"          # de
     r"|r[ée]ponse automatique|absence du bureau"        # fr
     r"|respuesta autom[áa]tica|fuera de la oficina"     # es
     r")",
     re.I,
 )
+# Delivery-failure phrases are NOT in the list above. They used to be, and because these
+# are anchored but not corroborated, "Delivery has failed for our shipment, can you check
+# the ticket?" was read as machine mail and silently produced no ticket. Bounces are now
+# _is_bounce's job, which additionally requires a daemon sender or real DSN structure.
 
 
 def _is_auto_generated(sender: str, subject: str) -> bool:
@@ -211,6 +213,103 @@ def _is_auto_generated(sender: str, subject: str) -> bool:
     to be picked up by hand rather than appearing as a ticket."""
     sender = (parse_addr(sender or "")[1] or sender or "").strip()
     return bool(_AUTO_SENDERS.match(sender) or _AUTO_SUBJECTS.match(subject or ""))
+
+
+# ---- bounces --------------------------------------------------------------
+# A hard bounce is a delivery failure for mail WE sent, so it belongs on the ticket that
+# sent it. Left alone it did the opposite of useful: it opened a junk ticket from
+# MAILER-DAEMON, while the ticket that actually failed to reach its customer looked
+# perfectly healthy and the agent believed they had replied.
+_BOUNCE_SENDERS = re.compile(r"^(?:mailer-daemon|postmaster)@", re.I)
+# Anchored at the start of the subject, like the auto-reply markers, so a customer writing
+# ABOUT a delivery is untouched.
+_BOUNCE_SUBJECTS = re.compile(
+    r"^\s*(?:(?:re|fw|fwd)\s*:\s*)*(?:"
+    r"undeliverable|undelivered mail|delivery status notification|returned mail"
+    r"|mail delivery (?:failed|subsystem)|delivery has failed|failure notice"
+    r"|unzustellbar|nicht zustellbar|échec de la remise|no se pudo entregar"
+    r")",
+    re.I,
+)
+# Structure only a real DSN has (RFC 3464 fields, or an SMTP status line). Anchoring the
+# subject alone is not enough: "Delivery has failed for our shipment, can you check?" is a
+# plausible subject for an industrial after-sales desk, and swallowing it would cost the
+# customer their ticket. Requiring machine structure in the body separates the two.
+_DSN_MARKERS = re.compile(
+    r"^\s*(?:Final-Recipient|Original-Recipient|Diagnostic-Code|Reporting-MTA|Action:\s*failed)"
+    r"|\b[45]\d\d[ -]\d\.\d\.\d\b|\bStatus:\s*[45]\.\d\.\d\b",
+    re.M | re.I,
+)
+# Our own outgoing subjects are always "[TKT-ID] ...", and a bounce quotes the original
+# subject — in its own subject ("Undeliverable: [INB-0002] ..."), in the headers frappe
+# lifts out of an attached original, or in the body. The Message-ID would be the precise
+# key, but frappe discards it: show_attached_email_headers_in_content keeps only
+# From/To/Subject/Date (receive.py:559-571), and message/delivery-status parts are dropped
+# by process_part entirely. The ticket id in the subject is what actually survives.
+_TICKET_IN_TEXT = re.compile(r"\[([A-Z0-9]{2,12}(?:-[A-Z0-9]{2,12})?-\d{3,})\]")
+# The address that failed, as reported in the DSN body.
+_FAILED_RECIPIENT = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+
+
+def _is_bounce(sender: str, subject: str, body: str = "") -> bool:
+    """A delivery failure report, as opposed to a customer writing about a delivery.
+
+    The sender alone settles it when a mail transfer agent reports the failure itself. A
+    bounce relayed from some other address has to prove itself twice: the subject must
+    OPEN with a failure phrase, and the body must carry DSN structure. Either signal on its
+    own produces false positives on ordinary support mail, and a false positive here means
+    a customer's request silently never becomes a ticket."""
+    sender = (parse_addr(sender or "")[1] or sender or "").strip()
+    if _BOUNCE_SENDERS.match(sender):
+        return True
+    return bool(_BOUNCE_SUBJECTS.match(subject or "")) and bool(_DSN_MARKERS.search(body or ""))
+
+
+def _file_bounce(doc) -> bool:
+    """Record a delivery failure on the ticket whose mail bounced. Returns True when it
+    was handled, so the caller knows not to open a ticket from it.
+
+    Filed as a WORK NOTE, not a client message: "we could not reach this address" is
+    something the team must see and the customer must not. Work notes sit at permlevel 1,
+    so frappe strips them from a client read for free.
+
+    Returning True on an unmatched bounce is deliberate — a bounce is never a support
+    request, so even when we cannot tell which ticket it belongs to the right outcome is
+    "no ticket", not "junk ticket"."""
+    body = _clean_body(_mail_body(doc), is_reply=False)
+    haystack = f"{doc.subject or ''}\n{body}"
+    match = _TICKET_IN_TEXT.search(haystack)
+    ticket = match.group(1) if match else None
+    if not ticket or not frappe.db.exists("Support Ticket", ticket):
+        frappe.logger("helpdesk").info(
+            f"bounce from {doc.sender} could not be matched to a ticket: {doc.subject!r}"
+        )
+        return True
+
+    inbox = _support_inbox()
+    failed = next(
+        (
+            a
+            for a in _FAILED_RECIPIENT.findall(body)
+            if a.lower() != inbox and not _BOUNCE_SENDERS.match(a)
+        ),
+        None,
+    )
+    reason = " ".join(body.split())[:400] or "no detail supplied"
+    note = (
+        f"Delivery failed{f' to {failed}' if failed else ''} — this ticket's email did not "
+        f"reach the customer.\n\n{reason}"
+    )
+
+    t = frappe.get_doc("Support Ticket", ticket)
+    if any((r.body or "").startswith("Delivery failed") and reason in (r.body or "") for r in (t.notes or [])):
+        return True  # same bounce redelivered
+    t.append("notes", {"author": "Mail system", "note_on": now_datetime(), "body": note})
+    # Surfaces the ticket as unread for the team — an agent believing they replied when
+    # they did not is the whole problem this solves.
+    t.last_activity_on = now_datetime()
+    t.save(ignore_permissions=True)
+    return True
 
 
 def _ack_key(recipient: str) -> str:
@@ -474,6 +573,11 @@ def on_communication(doc, method=None):
         return
     if doc.reference_doctype:
         return  # linked to some other doctype — not ours
+    # A bounce is a failure report about mail WE sent, so it belongs on the ticket that
+    # sent it — never as a new ticket. Checked before intake because a DSN otherwise looks
+    # exactly like a fresh inbound email.
+    if _is_bounce(doc.sender, doc.subject, _mail_body(doc)) and _file_bounce(doc):
+        return
     name = _open_ticket_from_email(doc.sender, doc.subject, _mail_body(doc))
     if name:
         doc.db_set("reference_doctype", "Support Ticket", update_modified=False)
