@@ -210,17 +210,22 @@ def _mark_read(ticket: str, user: str | None = None):
 
 @frappe.whitelist()
 def unread_tickets():
-    """Ticket names with activity this agent hasn't seen. Staff only.
+    """Ticket names with activity this agent hasn't seen. Staff only, and scoped.
 
-    Read scope still applies: this only reports names, and the ticket bodies come from the
-    normal permission-checked list fetch, so a name here can never expose a ticket the
-    caller couldn't already read."""
+    `get_list`, not `get_all`: get_all ignores permission_query_conditions, so it would
+    report activity on every ticket on the site — including other teams' and other
+    clients' — to any staff member who called it. Nothing visibly leaked, because the UI
+    only draws a dot on rows it already fetched through the scoped list, but the endpoint
+    is whitelisted and answers a direct REST call too. The agent tier is deliberately
+    narrow everywhere else in this file; it has no business being wide here.
+    """
     _require_team()
     user = frappe.session.user
-    rows = frappe.get_all(
+    rows = frappe.get_list(
         "Support Ticket",
         filters={"last_activity_on": ["is", "set"]},
         fields=["name", "last_activity_on"],
+        limit_page_length=0,
     )
     if not rows:
         return []

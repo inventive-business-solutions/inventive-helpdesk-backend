@@ -177,7 +177,7 @@ def can_receive_email(ticket) -> bool:
 # ---- reply policy ---------------------------------------------------------
 # What happens to a staff reply, decided in one place. Each value is also the `kind`
 # recorded in Ticket Email Log, so the audit trail says WHY a mail went out.
-FORCED = "Reply"  # no portal exists for them — email is the only channel
+FORCED = "Forced Reply"  # no portal exists for them — email is the only channel
 REQUESTED = "Reply"  # the agent asked for it
 FIRST_RESPONSE = "First Response"  # one-time, sent even though the toggle was off
 INTERNAL = None  # saved to the thread, not emailed

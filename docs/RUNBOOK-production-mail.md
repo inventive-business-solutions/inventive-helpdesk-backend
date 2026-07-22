@@ -298,6 +298,54 @@ Stop at the first failure; each step depends on the one before.
   replies, because a false positive withholds the acknowledgement and the sender hears
   nothing at all.
 
+## The whole site returns 404 after restarting services
+
+Happened on 2026-07-23 and cost about an hour, so the diagnosis is written down.
+
+**Symptom.** Every URL on the backend host returns `404 page not found` (Traefik's own page,
+not Frappe's). The Next.js frontend still answers, so Traefik itself is fine. Mail keeps
+flowing, because `scheduler` and the `queue-*` workers never touch Traefik or nginx.
+
+**Chain.**
+
+```
+backend 0/1  ->  Swarm DNS has no "backend" entry
+             ->  nginx: [emerg] host not found in upstream "backend:8000"
+             ->  frontend (nginx) exits, 0/1
+             ->  Traefik has no healthy task, DROPS the router
+             ->  404 for every request
+```
+
+A 404 rather than a 502 is the tell: 502 means "route exists, upstream sick", 404 means
+Traefik has no route at all, which only happens when the service has no healthy task.
+
+**Root cause.** `restart_policy: condition: on-failure` restarts only on a NON-ZERO exit.
+Gunicorn exits **0** when it shuts down on SIGTERM, so Swarm marked the task `complete`,
+considered it finished successfully, and never started another. The service sat at 0/1
+reporting no error. Restarting it does nothing — Swarm does not believe anything is wrong.
+
+**Recovery.** Force a new task by scaling:
+
+```
+Portainer -> Services -> <stack>_backend -> Replicas 0 -> Apply -> Replicas 1 -> Apply
+```
+
+Then leave `frontend` alone; it is crash-looping on a non-zero exit, so it restarts by
+itself as soon as `backend` resolves in Swarm DNS.
+
+**Fixed going forward.** Every long-running service in `deploy/docker-compose.yml` now uses
+`condition: any` (Docker's own default) instead of `on-failure`; the one-shot jobs keep
+`condition: none`. **A stack that was deployed before that change still carries the old
+policy — it only takes effect on the next stack redeploy.**
+
+**Where to look.** Portainer -> Services -> the service -> the **Tasks** table, not Logs. A
+container that never started writes no logs; the task row carries the status and error. Over
+SSH the same thing, expanded:
+
+```
+docker service ps --no-trunc <stack>_backend
+```
+
 ## Rollback
 
 Mail is entirely site configuration; no code change is involved. To stop all mail flow,

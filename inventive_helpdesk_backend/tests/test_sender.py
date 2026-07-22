@@ -336,6 +336,21 @@ class TestReplyPolicy(IntegrationTestCase):
                     self.assertTrue(send, "replying into a void — this sender has no portal")
                     self.assertEqual(kind, sender.FORCED)
 
+    def test_the_audit_log_can_tell_a_forced_reply_from_a_requested_one(self):
+        """The two carry different meaning and must not collapse to one value.
+
+        FORCED and REQUESTED were both the literal "Reply", so Ticket Email Log could not
+        answer why a mail went out — the one question it exists for. "Was this sent because
+        the agent asked, or because the customer has no portal to read it in?" is exactly
+        what you need months later.
+        """
+        self.assertNotEqual(
+            sender.FORCED, sender.REQUESTED, "a forced reply must be distinguishable in the log"
+        )
+        allowed = frappe.get_meta("Ticket Email Log").get_field("kind").options.split("\n")
+        for kind in (sender.FORCED, sender.REQUESTED, sender.FIRST_RESPONSE):
+            self.assertIn(kind, allowed, f"{kind!r} is not a valid Ticket Email Log kind")
+
     def test_a_registered_user_honours_the_toggle_once_they_have_been_told(self):
         t = self._ticket("policy.registered@example.test")
         t.db_set("first_response_notified_on", frappe.utils.now_datetime(), update_modified=False)
@@ -400,7 +415,10 @@ class TestReplyPolicy(IntegrationTestCase):
         )
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0].recipient, "policy.contact@example.test")
-        self.assertEqual(rows[0].kind, "Reply")
+        # "Forced Reply", not "Reply": this contact has no portal, so the mail went out
+        # regardless of the toggle. The log has to record which of those two it was, or it
+        # cannot answer why the mail was sent — see reply_plan's constants.
+        self.assertEqual(rows[0].kind, "Forced Reply")
 
 
 class TestEmailLogReconciliation(IntegrationTestCase):

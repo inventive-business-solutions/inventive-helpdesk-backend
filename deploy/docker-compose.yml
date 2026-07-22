@@ -1,3 +1,19 @@
+# Long-running services use `restart_policy: condition: any`, NOT the `on-failure` that
+# frappe_docker's example ships with. `on-failure` restarts only on a NON-ZERO exit, and a
+# process that shuts down politely on SIGTERM exits 0 — so Swarm records the task as
+# `complete`, decides it finished successfully, and never starts another one. The service
+# sits at 0/1 indefinitely and reports no error anywhere.
+#
+# That took production down on 2026-07-23. A restart sent SIGTERM to `backend`, gunicorn
+# logged "Handling signal: term / Shutting down: Master" and exited 0, and Swarm left it
+# stopped. nginx then crash-looped on `host not found in upstream "backend:8000"`, Traefik
+# dropped the router for having no healthy task, and every request returned 404. Restarting
+# individual services could not fix it, because Swarm did not believe anything was wrong;
+# only scaling to 0 and back forced a new task.
+#
+# `any` is Docker's own default for long-running services and is what these should always
+# have been. The one-shot jobs below (migration, configurator, create-site, backup-sites)
+# deliberately keep `condition: none` — they are meant to run once and stop.
 x-custom-image: &custom_image
   image: ${IMAGE_NAME:?No image set}:${VERSION:?No version set}
 
@@ -30,7 +46,7 @@ services:
       FORWARDED_ALLOW_IPS: "*"
     deploy:
       restart_policy:
-        condition: on-failure
+        condition: any
     volumes:
       - sites:/home/frappe/frappe-bench/sites
     networks:
@@ -48,7 +64,7 @@ services:
       - nginx-entrypoint.sh
     deploy:
       restart_policy:
-        condition: on-failure
+        condition: any
       labels:
         - traefik.enable=true
         - traefik.swarm.network=traefik-public
@@ -85,7 +101,7 @@ services:
     <<: *custom_image
     deploy:
       restart_policy:
-        condition: on-failure
+        condition: any
     command: bench worker --queue default
     volumes:
       - sites:/home/frappe/frappe-bench/sites
@@ -102,7 +118,7 @@ services:
     <<: *custom_image
     deploy:
       restart_policy:
-        condition: on-failure
+        condition: any
     command: bench worker --queue long,default,short
     volumes:
       - sites:/home/frappe/frappe-bench/sites
@@ -119,7 +135,7 @@ services:
     <<: *custom_image
     deploy:
       restart_policy:
-        condition: on-failure
+        condition: any
     command: bench worker --queue short,default
     volumes:
       - sites:/home/frappe/frappe-bench/sites
@@ -136,7 +152,7 @@ services:
     <<: *custom_image
     deploy:
       restart_policy:
-        condition: on-failure
+        condition: any
     command: bench schedule
     volumes:
       - sites:/home/frappe/frappe-bench/sites
@@ -156,7 +172,7 @@ services:
       - /home/frappe/frappe-bench/apps/frappe/socketio.js
     deploy:
       restart_policy:
-        condition: on-failure
+        condition: any
     volumes:
       - sites:/home/frappe/frappe-bench/sites
     networks:
@@ -294,7 +310,7 @@ services:
     image: redis:7-alpine@sha256:b1addbe72465a718643cff9e60a58e6df1841e29d6d7d60c9a85d8d72f08d1a7
     deploy:
       restart_policy:
-        condition: on-failure
+        condition: any
     networks:
       - bench-network
     healthcheck:
@@ -310,7 +326,7 @@ services:
     image: redis:7-alpine@sha256:b1addbe72465a718643cff9e60a58e6df1841e29d6d7d60c9a85d8d72f08d1a7
     deploy:
       restart_policy:
-        condition: on-failure
+        condition: any
     volumes:
       - redis-queue-data:/data
     networks:

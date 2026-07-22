@@ -692,6 +692,50 @@ class TestUnreadMarkers(IntegrationTestCase):
         frappe.set_user(self.b)
         self.assertIn(self.ticket.name, unread_tickets())
 
+    def test_it_never_reports_a_ticket_the_caller_cannot_read(self):
+        """Scope, not just staff-or-not.
+
+        This used to call frappe.get_all, which ignores permission_query_conditions, so it
+        answered with every ticket on the site — other teams', other clients' — to anyone
+        holding a staff role. Nothing showed in the UI, because the dot is only drawn on
+        rows already fetched through the scoped list, but the endpoint is whitelisted and
+        answers a direct REST call too.
+
+        The out-of-scope ticket needs an assignment_group these agents do not belong to:
+        ticket_query lets any staff member see the unassigned triage inbox, so a ticket
+        with no group is readable by everyone and would make this test prove nothing.
+        """
+        if not frappe.db.exists("Assignment Group", "Unread Foreign Team"):
+            frappe.get_doc(
+                {"doctype": "Assignment Group", "group_name": "Unread Foreign Team"}
+            ).insert(ignore_permissions=True)
+        foreign = frappe.get_doc({
+            "doctype": "Support Ticket",
+            "title": "Another team's ticket",
+            "description": "x",
+            "ticket_type": "Query",
+            "priority": "Low",
+            "status": "New",
+            "client": self.client,
+            "division": self.division,
+            "assignment_group": "Unread Foreign Team",
+        }).insert(ignore_permissions=True)
+        foreign.db_set("last_activity_on", frappe.utils.now_datetime())
+
+        frappe.set_user(self.a)
+        readable = {t.name for t in frappe.get_list("Support Ticket", fields=["name"], limit_page_length=0)}
+        self.assertNotIn(foreign.name, readable, "fixture is wrong — this must be out of scope")
+
+        reported = set(unread_tickets())
+        self.assertTrue(reported, "fixture should leave at least one ticket unread")
+        self.assertNotIn(
+            foreign.name, reported, "reported a ticket belonging to a team the caller is not on"
+        )
+        self.assertFalse(
+            reported - readable,
+            f"reported tickets outside the caller's read scope: {sorted(reported - readable)}",
+        )
+
     def test_reading_clears_it_only_for_the_reader(self):
         # The reason this is a separate doctype rather than a flag on the ticket.
         frappe.set_user(self.a)

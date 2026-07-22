@@ -9,7 +9,7 @@
  "field_order": ["ticket","kind","recipient","subject","message_id","triggered_by","queued_on","delivery_state","failure_reason"],
  "fields": [
   {"fieldname":"ticket","fieldtype":"Link","options":"Support Ticket","label":"Ticket","in_list_view":1,"reqd":1,"search_index":1},
-  {"fieldname":"kind","fieldtype":"Select","options":"Acknowledgement\nReply\nFirst Response\nStatus","label":"Kind","in_list_view":1},
+  {"fieldname":"kind","fieldtype":"Select","options":"Acknowledgement\nReply\nForced Reply\nFirst Response\nStatus","description":"Why this mail was sent. Reply = the agent asked for it. Forced Reply = the recipient has no portal, so email was the only channel and the toggle was overridden. First Response = the one-time mail sent despite the toggle being off.","label":"Kind","in_list_view":1},
   {"fieldname":"recipient","fieldtype":"Data","label":"To","in_list_view":1,"search_index":1},
   {"fieldname":"subject","fieldtype":"Data","label":"Subject"},
   {"fieldname":"message_id","fieldtype":"Data","label":"Message ID","search_index":1},

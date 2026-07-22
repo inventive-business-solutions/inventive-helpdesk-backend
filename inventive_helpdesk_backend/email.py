@@ -146,11 +146,16 @@ def _log_outgoing(ticket, message_id, recipient, subject, kind):
     Best-effort, like the threading anchor: losing a log row must never cost the mail that
     already went out or the ticket action that triggered it.
     """
+    # Read from the doctype rather than repeating the list here. A hardcoded copy silently
+    # coerced anything it did not recognise to "Reply", so adding a kind to the Select and
+    # forgetting this line would have produced a log that looked fine and recorded the
+    # wrong reason — the failure mode an audit trail exists to prevent.
+    allowed = set(frappe.get_meta("Ticket Email Log").get_field("kind").options.split("\n"))
     try:
         frappe.get_doc({
             "doctype": "Ticket Email Log",
             "ticket": ticket,
-            "kind": kind if kind in ("Acknowledgement", "Reply", "First Response", "Status") else "Reply",
+            "kind": kind if kind in allowed else "Reply",
             "recipient": recipient,
             "subject": subject,
             "message_id": message_id,
