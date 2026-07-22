@@ -90,5 +90,11 @@ scheduler_events = {
         "*/2 * * * *": [
             "frappe.email.doctype.email_account.email_account.pull",
         ],
+        # Mirror Email Queue outcomes onto Ticket Email Log. Email Queue writes its status
+        # with frappe.db.set_value, which fires no doc events, so there is nothing to hook —
+        # it has to be pulled.
+        "*/5 * * * *": [
+            "inventive_helpdesk_backend.email.reconcile_email_log",
+        ],
     },
 }

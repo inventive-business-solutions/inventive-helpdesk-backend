@@ -137,6 +137,51 @@ def _log_outgoing(ticket, message_id, recipient, subject, kind):
         frappe.log_error(title="Ticket email log write failed")
 
 
+def reconcile_email_log():
+    """Update Ticket Email Log rows with what actually happened to the mail.
+
+    The log is written at queue time, so every row starts "Queued" — and nothing ever moved
+    it, which meant the audit trail could not tell a delivered mail from a refused one.
+    Found during pre-merge verification: two rows sat at "Queued" while their Email Queue
+    entries had been in Error for hours.
+
+    Reconciled on a schedule rather than by a hook because Email Queue writes its status
+    through frappe.db.set_value (email_queue.py:126), which bypasses doc events entirely —
+    there is nothing to subscribe to.
+
+    Only touches rows still marked Queued, and only where the Email Queue row still exists;
+    frappe purges those after 30 days, so anything older keeps its last known state rather
+    than being falsely reported as failed.
+    """
+    pending = frappe.get_all(
+        "Ticket Email Log",
+        filters={"delivery_state": "Queued", "message_id": ["is", "set"]},
+        fields=["name", "message_id"],
+        limit=500,
+    )
+    if not pending:
+        return
+    queued = {
+        q.message_id: q
+        for q in frappe.get_all(
+            "Email Queue",
+            filters={"message_id": ["in", [p.message_id for p in pending]]},
+            fields=["message_id", "status", "error"],
+        )
+    }
+    state = {"Sent": "Sent", "Error": "Failed", "Expired": "Failed"}
+    for row in pending:
+        q = queued.get(row.message_id)
+        if not q or q.status not in state:
+            continue
+        frappe.db.set_value(
+            "Ticket Email Log",
+            row.name,
+            {"delivery_state": state[q.status], "failure_reason": (q.error or "")[:1000] or None},
+            update_modified=False,
+        )
+
+
 def _anchor_outgoing(ticket, message_id, recipient, subject, html):
     """Record outgoing mail as a Communication so a reply can still find its ticket after
     the Email Queue row is gone.

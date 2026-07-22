@@ -401,3 +401,69 @@ class TestReplyPolicy(IntegrationTestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0].recipient, "policy.contact@example.test")
         self.assertEqual(rows[0].kind, "Reply")
+
+
+class TestEmailLogReconciliation(IntegrationTestCase):
+    """The log is written at queue time, so every row starts "Queued". Nothing moved it
+    until this existed, which meant the audit trail could not tell a delivered mail from a
+    refused one — found with two rows sitting at "Queued" whose Email Queue entries had
+    been in Error for hours."""
+
+    def tearDown(self):
+        frappe.db.delete("Ticket Email Log", {"message_id": ["like", "recon.test%"]})
+        frappe.db.delete("Email Queue", {"message_id": ["like", "recon.test%"]})
+
+    def _log(self, message_id):
+        return frappe.get_doc({
+            "doctype": "Ticket Email Log", "ticket": self.ticket, "kind": "Reply",
+            "recipient": "someone@example.test", "message_id": message_id,
+            "queued_on": frappe.utils.now_datetime(), "delivery_state": "Queued",
+        }).insert(ignore_permissions=True)
+
+    def setUp(self):
+        client = _ensure("Client", {"client_name": "Recon Co", "client_code": "RCN"})
+        division = _ensure(
+            "Division", {"division_name": "Recon Div", "division_code": "RCD", "client": client}
+        )
+        self.ticket = frappe.get_doc({
+            "doctype": "Support Ticket", "title": "Recon", "description": "x",
+            "ticket_type": "Query", "priority": "Low", "status": "New",
+            "client": client, "division": division,
+        }).insert(ignore_permissions=True).name
+
+    def test_a_delivered_mail_is_marked_sent_and_a_refused_one_failed(self):
+        from inventive_helpdesk_backend.email import reconcile_email_log
+
+        for mid, status in (("recon.test.ok", "Sent"), ("recon.test.bad", "Error")):
+            self._log(mid)
+            frappe.get_doc({
+                "doctype": "Email Queue", "message_id": mid, "status": status,
+                "sender": "helpdesk@example.test", "message": "x", "priority": 1,
+                "error": "550 mailbox unavailable" if status == "Error" else None,
+            }).insert(ignore_permissions=True)
+
+        reconcile_email_log()
+
+        states = {
+            r.message_id: (r.delivery_state, r.failure_reason)
+            for r in frappe.get_all(
+                "Ticket Email Log",
+                filters={"message_id": ["like", "recon.test%"]},
+                fields=["message_id", "delivery_state", "failure_reason"],
+            )
+        }
+        self.assertEqual(states["recon.test.ok"][0], "Sent")
+        self.assertEqual(states["recon.test.bad"][0], "Failed")
+        self.assertIn("550", states["recon.test.bad"][1] or "")
+
+    def test_a_row_whose_queue_entry_was_purged_keeps_its_last_state(self):
+        # Email Queue is purged at 30 days. Absence is not evidence of failure, so an
+        # unmatched row must stay Queued rather than being reported as failed.
+        from inventive_helpdesk_backend.email import reconcile_email_log
+
+        self._log("recon.test.purged")
+        reconcile_email_log()
+        self.assertEqual(
+            frappe.db.get_value("Ticket Email Log", {"message_id": "recon.test.purged"}, "delivery_state"),
+            "Queued",
+        )
