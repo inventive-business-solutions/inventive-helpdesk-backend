@@ -758,7 +758,11 @@ def send_ticket_ack(doc, method=None):
     if recipient and _ack_allowed(recipient):
         subject = f"[{doc.name}] " + ((doc.title or "").strip() or "We've received your request")
         _queue_mail(
-            recipient, subject, _ack_email_html(doc.name, doc.title), "Ticket acknowledgement", doc.name,
+            recipient,
+            subject,
+            _ack_email_html(doc.name, doc.title, _client_cta(doc, "View your ticket")),
+            "Ticket acknowledgement",
+            doc.name,
             log_kind="Acknowledgement",
         )
 
@@ -777,11 +781,12 @@ def notify_client_reply(ticket, body, kind="Reply"):
     if not recipient:
         return
     subject = f"[{ticket.name}] " + ((ticket.title or "").strip() or "Update on your request")
-    portal = _portal_ticket_url(ticket.name)
     html = (
-        _first_response_email_html(ticket.name, body, portal)
+        # First Response is only ever planned for a Registered sender, so the portal link
+        # is always the right call to action there.
+        _first_response_email_html(ticket.name, body, _portal_ticket_url(ticket.name))
         if kind == "First Response"
-        else _reply_email_html(ticket.name, body, portal)
+        else _reply_email_html(ticket.name, body, _client_cta(ticket, "Reply in the portal"))
     )
     _queue_mail(recipient, subject, html, "Ticket reply", ticket.name, log_kind=kind)
 
@@ -816,11 +821,13 @@ def on_ticket_update(doc, method=None):
     if not recipient:
         return
     heading, message = _STATUS_NOTIFY[doc.status]
+    # "Pending Client" asks them to respond; the others just invite a look.
+    label = "Reply in the portal" if doc.status == "Pending Client" else "View your ticket"
     subject = f"[{doc.name}] " + ((doc.title or "").strip() or heading)
     _queue_mail(
         recipient,
         subject,
-        _status_email_html(doc.name, heading, message, doc.status, _portal_ticket_url(doc.name)),
+        _status_email_html(doc.name, heading, message, doc.status, _client_cta(doc, label)),
         f"Ticket {doc.status} notification",
         doc.name,
         log_kind="Status",
@@ -838,6 +845,40 @@ def _portal_button(url, label):
     )
 
 
+def _client_portal_url(ticket):
+    """Portal deep link, but only for someone who can actually sign in.
+
+    Offering "View your ticket" to a sender with no account sends them to a login wall
+    they cannot pass — worse than offering nothing, because it looks like the system
+    expects something of them that is impossible. Only a Registered sender has a login;
+    an unregistered sender and a known contact who was never invited do not.
+    """
+    from inventive_helpdesk_backend import sender
+
+    kind, _address, _reason = sender.classify(ticket)
+    return _portal_ticket_url(ticket.name) if kind == sender.REGISTERED else ""
+
+
+def _reply_by_email_line():
+    """The call to action for a client with no portal: the channel they actually have.
+
+    Accurate as well as useful — a reply threads back onto the ticket via the Message-ID
+    anchor, so this is not a polite fiction.
+    """
+    return (
+        '<p style="font-size:13.5px;line-height:1.6;color:#464b5c;margin:0 0 22px;">'
+        "<b>Just reply to this email</b> and your message will be added to the ticket. "
+        "There is no account to set up."
+        "</p>"
+    )
+
+
+def _client_cta(ticket, portal_label):
+    """Portal button for someone who can sign in; reply-by-email for everyone else."""
+    url = _client_portal_url(ticket)
+    return _portal_button(url, portal_label) if url else _reply_by_email_line()
+
+
 def _shell(inner):
     return (
         '<div style="font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;'
@@ -845,7 +886,7 @@ def _shell(inner):
     )
 
 
-def _ack_email_html(ticket_name, subject_line):
+def _ack_email_html(ticket_name, subject_line, cta):
     subj = frappe.utils.escape_html((subject_line or "").strip() or "Your request")
     return _shell(f"""
   <h2 style="font-size:20px;font-weight:700;margin:0 0 6px;">We&#39;ve got your request</h2>
@@ -858,7 +899,7 @@ def _ack_email_html(ticket_name, subject_line):
     <div style="font-size:18px;font-weight:700;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#4f46e5;margin-top:4px;">{ticket_name}</div>
     <div style="font-size:13px;color:#464b5c;margin-top:6px;">{subj}</div>
   </div>
-  {_portal_button(_portal_ticket_url(ticket_name), "View your ticket")}
+  {cta}
   <p style="font-size:12.5px;line-height:1.6;color:#6b7182;margin:0 0 18px;">
     Please quote <b>{ticket_name}</b> in any follow-up so we can find your request quickly.
   </p>
@@ -867,7 +908,7 @@ def _ack_email_html(ticket_name, subject_line):
   </p>""".strip())
 
 
-def _reply_email_html(ticket_name, body, portal_url):
+def _reply_email_html(ticket_name, body, cta):
     reply = frappe.utils.escape_html((body or "").strip()).replace("\n", "<br>") or "(no message)"
     return _shell(f"""
   <h2 style="font-size:20px;font-weight:700;margin:0 0 6px;">New reply on {ticket_name}</h2>
@@ -875,10 +916,7 @@ def _reply_email_html(ticket_name, body, portal_url):
   <div style="background:#f4f5fb;border-left:3px solid #4f46e5;border-radius:6px;padding:12px 16px;margin:0 0 18px;font-size:14px;line-height:1.6;color:#1e2230;">
     {reply}
   </div>
-  <p style="font-size:13px;line-height:1.6;color:#464b5c;margin:0 0 16px;">
-    You can add more details or continue the conversation in your portal:
-  </p>
-  {_portal_button(portal_url, "Reply in the portal")}
+  {cta}
   <p style="font-size:12px;color:#8a90a2;line-height:1.6;margin:0;border-top:1px solid #eceef3;padding-top:14px;">
     Ticket {ticket_name} · Inventive Helpdesk
   </p>""".strip())
@@ -909,9 +947,8 @@ def _first_response_email_html(ticket_name, body, portal_url):
   </p>""".strip())
 
 
-def _status_email_html(ticket_name, heading, message, status, portal_url):
+def _status_email_html(ticket_name, heading, message, status, cta):
     badge = "#16a34a" if status == "Resolved" else "#d97706"  # green resolved / amber pending
-    label = "Reply in the portal" if status == "Pending Client" else "View your ticket"
     return _shell(f"""
   <h2 style="font-size:20px;font-weight:700;margin:0 0 6px;">{heading}</h2>
   <p style="font-size:14px;line-height:1.6;color:#464b5c;margin:0 0 16px;">{frappe.utils.escape_html(message)}</p>
@@ -919,7 +956,7 @@ def _status_email_html(ticket_name, heading, message, status, portal_url):
     <span style="display:inline-block;font-size:12px;font-weight:700;color:#fff;background:{badge};padding:4px 12px;border-radius:20px;">{status}</span>
     <span style="font-size:13px;color:#6b7182;margin-left:8px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;">{ticket_name}</span>
   </div>
-  {_portal_button(portal_url, label)}
+  {cta}
   <p style="font-size:12px;color:#8a90a2;line-height:1.6;margin:0;border-top:1px solid #eceef3;padding-top:14px;">
     Inventive Helpdesk · After-sales support
   </p>""".strip())

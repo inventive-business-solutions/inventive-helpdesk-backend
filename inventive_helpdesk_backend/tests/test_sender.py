@@ -467,3 +467,60 @@ class TestEmailLogReconciliation(IntegrationTestCase):
             frappe.db.get_value("Ticket Email Log", {"message_id": "recon.test.purged"}, "delivery_state"),
             "Queued",
         )
+
+
+class TestPortalLinksOnlyForPeopleWhoHaveOne(IntegrationTestCase):
+    """Never offer a portal link to someone with no account.
+
+    Caught in live testing, not by a test: an unregistered sender's acknowledgement
+    carried "View your ticket" pointing at /portal/tickets/INB-0007. They have no login, so
+    it is a wall they cannot pass — worse than offering nothing, because it looks like the
+    system expects something of them that is impossible.
+
+    The replacement is not a blank space but the channel they actually have: replying to
+    the email threads back onto the ticket, so "just reply to this email" is accurate.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.client = _ensure("Client", {"client_name": "Portal Co", "client_code": "PTL"})
+        cls.division = _ensure(
+            "Division", {"division_name": "Portal Div", "division_code": "PTD", "client": cls.client}
+        )
+        _poc(cls.client, cls.division, "portal.registered@example.test", with_login=True)
+        _poc(cls.client, cls.division, "portal.contact@example.test", with_login=False)
+
+    def _ticket(self, from_email):
+        return frappe.get_doc({
+            "doctype": "Support Ticket", "title": "Portal fixture", "description": "x",
+            "ticket_type": "Query", "priority": "Low", "status": "New",
+            "client": self.client, "division": self.division, "from_email": from_email,
+        }).insert(ignore_permissions=True)
+
+    def test_only_a_registered_sender_is_offered_the_portal(self):
+        for addr, expect_portal in (
+            ("portal.registered@example.test", True),
+            ("portal.contact@example.test", False),   # on file, never invited — no login
+            ("stranger@example.test", False),          # unknown entirely
+            ("noreply@vendor.test", False),            # unmonitored
+        ):
+            with self.subTest(addr=addr):
+                cta = helpdesk_email._client_cta(self._ticket(addr), "View your ticket")
+                if expect_portal:
+                    self.assertIn("/portal/tickets/", cta)
+                else:
+                    self.assertNotIn("/portal/tickets/", cta)
+                    self.assertIn("reply to this email", cta.lower())
+
+    def test_every_client_facing_email_respects_it(self):
+        # All three builders, so adding a fourth without a CTA is the only way to regress.
+        t = self._ticket("stranger@example.test")
+        cta = helpdesk_email._client_cta(t, "View your ticket")
+        for html in (
+            helpdesk_email._ack_email_html(t.name, t.title, cta),
+            helpdesk_email._reply_email_html(t.name, "we are on it", cta),
+            helpdesk_email._status_email_html(t.name, "h", "m", "Pending Client", cta),
+        ):
+            self.assertNotIn("/portal/tickets/", html)
+            self.assertIn("reply to this email", html.lower())
