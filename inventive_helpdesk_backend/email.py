@@ -609,9 +609,13 @@ def _append_client_reply(ticket_name, doc):
     if not body:
         return
     ticket = frappe.get_doc("Support Ticket", ticket_name)
-    # A Communication is only ever inserted once, but a retried pull could in principle
-    # re-deliver the same message; matching on the body keeps that idempotent.
-    if any((r.body or "").strip() == body for r in (ticket.conversation or [])):
+    # Idempotency keys on the Communication, NOT on the body text. Body matching looks
+    # equivalent and is not: a client who sends the same wording twice — "any update?",
+    # "thanks", "still broken" — is ordinary support traffic, and matching on text threw
+    # the second one away silently, so the agent never saw the follow-up. Keying on the
+    # source keeps a genuine re-delivery idempotent without ever discarding a real message.
+    source = getattr(doc, "name", None)
+    if source and any((r.source_communication or "") == source for r in (ticket.conversation or [])):
         return
     sender = (parse_addr(doc.sender or "")[1] or doc.sender or "").strip().lower()
     ticket.append("conversation", {
@@ -620,6 +624,7 @@ def _append_client_reply(ticket_name, doc):
         "role": "Client",
         "message_on": now_datetime(),
         "body": body,
+        "source_communication": source,
     })
     # Marks the ticket unread for every agent except whoever posts next (see api.py).
     ticket.last_activity_on = now_datetime()
@@ -792,15 +797,21 @@ def notify_client_reply(ticket, body, kind="Reply"):
 
 
 # Status changes worth emailing the client about (heading, body message).
+#
+# Deliberately channel-NEUTRAL: not one of these sentences may name the portal or email.
+# Naming a channel here contradicts the call to action underneath, which _client_cta picks
+# per recipient — an unregistered sender was being told "please reply in the portal" in one
+# paragraph and "there is no account to set up" in the next. The CTA knows who it is
+# talking to; this text does not, so it must not guess.
 _STATUS_NOTIFY = {
     "Resolved": (
         "Your request has been resolved",
-        "We've marked this ticket as resolved. If it didn't fully solve things, just reopen it by "
-        "replying in the portal — we're happy to keep helping.",
+        "We've marked this ticket as resolved. If it didn't fully solve things, just let us know — "
+        "we're happy to keep helping.",
     ),
     "Pending Client": (
         "We need a little more from you",
-        "This ticket is waiting on your input. Please reply in the portal so we can move it forward.",
+        "This ticket is waiting on your input before we can move it forward.",
     ),
 }
 

@@ -11,7 +11,8 @@
   "role",
   "message_on",
   "body",
-  "attachments"
+  "attachments",
+  "source_communication"
  ],
  "fields": [
   {
@@ -47,6 +48,14 @@
    "fieldname": "attachments",
    "fieldtype": "Small Text",
    "label": "Attachments"
+  },
+  {
+   "description": "The inbound Communication this message came from, for messages that arrived by email. The idempotency key for email intake: matching on body text instead silently discarded a client who sent the same wording twice (\"any update?\"), which is ordinary support traffic. Empty for messages typed in the portal.",
+   "fieldname": "source_communication",
+   "fieldtype": "Data",
+   "hidden": 1,
+   "label": "Source Communication",
+   "read_only": 1
   }
  ],
  "grid_page_length": 50,

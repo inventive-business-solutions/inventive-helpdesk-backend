@@ -179,6 +179,44 @@ class TestReplyThreading(IntegrationTestCase):
         t.reload()
         self.assertEqual(len(t.conversation), 1)
 
+    def test_two_separate_mails_with_the_same_wording_both_appear(self):
+        """A client who sends the same words twice must be heard twice.
+
+        Regression. Intake used to dedupe on the body TEXT, which is indistinguishable
+        from a re-delivery only if you assume customers never repeat themselves — and
+        "any update?" is one of the most common things a customer sends. The second one
+        was dropped with no trace, so the agent saw a single nudge and the client
+        believed they had chased twice. Keyed on the source Communication now.
+        """
+        t = self._ticket()
+
+        def deliver(subject):
+            comm = frappe.get_doc({
+                "doctype": "Communication",
+                "communication_type": "Communication",
+                "communication_medium": "Email",
+                "sent_or_received": "Received",
+                "subject": subject,
+                "sender": "someone@example.test",
+                "content": "any update?",
+                "reference_doctype": "Support Ticket",
+                "reference_name": t.name,
+            }).insert(ignore_permissions=True)
+            helpdesk_email.on_communication(comm)
+            return comm
+
+        first, second = deliver("Re: fixture"), deliver("Re: fixture (again)")
+        self.assertNotEqual(first.name, second.name, "fixture must be two distinct mails")
+
+        t.reload()
+        bodies = [m.body for m in t.conversation]
+        self.assertEqual(bodies, ["any update?", "any update?"], f"a chase was swallowed: {bodies}")
+        self.assertEqual(
+            [m.source_communication for m in t.conversation],
+            [first.name, second.name],
+            "each message must record the mail it came from",
+        )
+
     def test_outgoing_communications_are_ignored(self):
         t = self._ticket()
         comm = frappe.get_doc({
@@ -739,6 +777,85 @@ class TestLoopProtection(IntegrationTestCase):
         finally:
             frappe.sendmail = original
         self.assertEqual(captured.get("email_headers"), {"X-Auto-Response-Suppress": "All"})
+
+class TestClientFacingWording(IntegrationTestCase):
+    """A client-facing email must not tell someone to use a door they have no key to.
+
+    The portal-link fix gated the BUTTON on whether the recipient can sign in, but left
+    the sentence above it hard-coded to "reply in the portal". An unregistered sender
+    therefore received both, one after the other:
+
+        "Please reply in the portal so we can move it forward."
+        "Just reply to this email ... There is no account to set up."
+
+    Observed on INB-0007 against a real Gmail address on 2026-07-22.
+    """
+
+    def setUp(self):
+        self.client = _ensure("Client", {"client_name": "Wording Co", "client_code": "WRD"})
+        self.division = _ensure(
+            "Division", {"division_name": "Wording Div", "division_code": "WDV", "client": self.client}
+        )
+
+    def _unregistered_ticket(self):
+        return frappe.get_doc({
+            "doctype": "Support Ticket",
+            "title": "Wording fixture",
+            "description": "problem",
+            "ticket_type": "Query",
+            "priority": "Low",
+            "status": "New",
+            "client": self.client,
+            "division": self.division,
+            # Nobody on file with this address -> Unregistered -> no portal login.
+            "from_email": "stranger@example.test",
+        }).insert(ignore_permissions=True)
+
+    def test_status_message_text_never_names_a_channel(self):
+        """The invariant, checked at the source rather than through a rendered page.
+
+        _client_cta picks the channel per recipient; these strings are shared by every
+        recipient and so cannot know which one is right."""
+        for status, (_heading, message) in helpdesk_email._STATUS_NOTIFY.items():
+            lowered = message.lower()
+            for word in ("portal", "sign in", "log in", "this email"):
+                self.assertNotIn(
+                    word, lowered, f"{status!r} names a channel the CTA is responsible for: {message!r}"
+                )
+
+    def test_an_unregistered_client_is_not_sent_to_the_portal(self):
+        import re
+
+        t = self._unregistered_ticket()
+        heading, message = helpdesk_email._STATUS_NOTIFY["Pending Client"]
+        html = helpdesk_email._status_email_html(
+            t.name, heading, message, "Pending Client",
+            helpdesk_email._client_cta(t, "Reply in the portal"),
+        )
+        text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html)).strip().lower()
+
+        self.assertIn("just reply to this email", text, "they must be told the channel they have")
+        self.assertNotIn("portal", text, f"an unregistered client was pointed at the portal: {text}")
+
+    def test_a_registered_client_still_gets_the_portal_button(self):
+        """The other half — the fix must not strip the portal from people who do have one."""
+        email = _poc_for(self.client, self.division, "wording.poc@example.test")
+        t = frappe.get_doc({
+            "doctype": "Support Ticket",
+            "title": "Wording fixture",
+            "description": "problem",
+            "ticket_type": "Query",
+            "priority": "Low",
+            "status": "New",
+            "client": self.client,
+            "division": self.division,
+            "from_email": email,
+        }).insert(ignore_permissions=True)
+
+        cta = helpdesk_email._client_cta(t, "Reply in the portal")
+        self.assertIn("Reply in the portal", cta)
+        self.assertNotIn("There is no account to set up", cta)
+
 
 def _ensure(doctype: str, values: dict) -> str:
     key = {k: v for k, v in values.items() if k in ("client_name", "division_name")}
