@@ -90,13 +90,21 @@ class SupportTicket(Document):
     def _clamp_client_authored_fields(self):
         """Force safe values on a ticket a client POC creates directly, so a hand-crafted
         REST payload can't open it pre-Resolved, self-assign it, or forge a staff reply.
-        No-op for staff, the Administrator/Guest system paths, and email intake."""
-        if self.from_email:
-            return
+        No-op for staff, the Administrator/Guest system paths, and email intake.
+
+        Email intake is recognised by WHO is inserting, never by what the payload says.
+        This used to return early on any truthy `from_email` — but `from_email` is a
+        permlevel-0 field and Support Client holds `create`, so a POC could set it in the
+        REST payload and skip the whole clamp: self-assign into a real team's queue, open
+        the ticket pre-Resolved, and append conversation rows as `kind="team"` to forge a
+        staff reply in their own thread. Both real intake paths are covered by the user
+        check below instead — production `on_communication` runs as Administrator, dev
+        `receive_webhook` as Guest."""
         user = frappe.session.user
         if user in ("Administrator", "Guest") or set(frappe.get_roles(user)) & TEAM_ROLES:
             return
         # The author is a portal client — pin everything they must not control.
+        self.from_email = None
         self.source = "Portal"
         self.status = "New"
         self.assignee = None

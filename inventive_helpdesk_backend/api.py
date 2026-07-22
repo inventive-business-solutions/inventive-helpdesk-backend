@@ -132,7 +132,11 @@ def add_note(ticket: str, body: str, attachments=None):
     body = (body or "").strip()
     if not body and not attachments:
         frappe.throw(_("Note cannot be empty"))
-    doc = frappe.get_doc("Support Ticket", ticket)
+    # _require_read, not a bare get_doc: _require_team only proves the caller is staff,
+    # and the agent tier is scoped (assigned-to-me / my teams' queues / triage). Without
+    # this any agent could write an internal note onto any ticket by name — including
+    # another team's — and bump its last_activity_on. Every sibling method here uses it.
+    doc = _require_read(ticket)
     doc.append("notes", {
         "author": _author(),
         "note_on": now_datetime(),

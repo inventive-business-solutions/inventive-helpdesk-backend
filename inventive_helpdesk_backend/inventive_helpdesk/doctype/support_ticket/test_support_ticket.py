@@ -50,6 +50,19 @@ def make_poc_user(email: str, client: str, division: str) -> str:
     return email
 
 
+def make_staff_outside_scope(email: str) -> str:
+    """A Support Team agent with no assignment, no team and no collaboration — so every
+    ticket in these fixtures is outside their read scope."""
+    if not frappe.db.exists("User", email):
+        user = frappe.get_doc({
+            "doctype": "User", "email": email, "first_name": "Outside", "last_name": "Agent",
+            "send_welcome_email": 0,
+        })
+        user.append("roles", {"role": "Support Team"})
+        user.insert(ignore_permissions=True)
+    return email
+
+
 def make_ticket(**kw):
     doc = frappe.get_doc({
         "doctype": "Support Ticket",
@@ -174,6 +187,50 @@ class TestSupportTicket(IntegrationTestCase):
         frappe.set_user(self.poc_a)
         with self.assertRaises(frappe.PermissionError):
             add_note(ta.name, "internal")
+
+    def test_a_client_cannot_escape_the_clamp_by_sending_from_email(self):
+        # `from_email` marks a ticket as email intake, and the clamp used to return early
+        # on it. But it is permlevel 0 and Support Client holds `create`, so a POC could
+        # set it in a REST payload and skip the clamp entirely: open the ticket
+        # pre-Resolved, route it into a real team's queue, and append a conversation row
+        # as kind="team" to forge a staff reply in their own thread.
+        # Real Link targets, so the test turns on the clamp rather than on link validation.
+        victim_member = make_member("_Test IC Victim Member")
+        victim_group = make_group("_Test IC Victim Group")
+        frappe.set_user(self.poc_a)
+        t = frappe.get_doc({
+            "doctype": "Support Ticket",
+            "title": "Forged", "description": "x", "ticket_type": "Query", "priority": "Low",
+            "client": self.client_a, "division": self.div_a,
+            "from_email": "attacker@example.test",  # the bypass
+            "status": "Resolved",
+            "assignee": victim_member,
+            "assignment_group": victim_group,
+            "conversation": [{"kind": "team", "role": "Team → Client", "body": "we fixed it"}],
+        }).insert()
+        frappe.set_user("Administrator")
+        t.reload()
+        self.assertEqual(t.status, "New", "a client set the opening status")
+        self.assertFalse(t.assignee, "a client self-assigned the ticket")
+        self.assertFalse(t.assignment_group, "a client routed the ticket into a team queue")
+        self.assertIsNone(t.from_email, "a client forged the intake marker")
+        self.assertEqual([r.kind for r in t.conversation], ["client"], "a client forged a staff reply")
+
+    def test_an_agent_cannot_note_on_a_ticket_they_cannot_read(self):
+        # add_note guarded with _require_team only, which proves the caller is staff but
+        # not that this ticket is in their scope. Agent tiers are scoped, so a bare
+        # get_doc let any agent write an internal note onto any ticket by name.
+        # Routed to a team the outsider is not in. An UNROUTED ticket would be readable by
+        # design — assignment_group IS NULL is the shared triage inbox any agent may pick
+        # up (permissions.ticket_query) — so it has to be routed for this to test anything.
+        other_team = make_group("_Test IC Other Team")
+        ta = make_ticket(client=self.client_a, division=self.div_a, assignment_group=other_team)
+        outsider = make_staff_outside_scope("_test.ic.outsider@example.com")
+        frappe.set_user(outsider)
+        with self.assertRaises(frappe.PermissionError):
+            add_note(ta.name, "should not land")
+        frappe.set_user("Administrator")
+        self.assertEqual(len(frappe.get_doc("Support Ticket", ta.name).notes), 0)
 
     def test_work_notes_stripped_from_client_read(self):
         # A client may read their OWN ticket, but internal work notes (permlevel-1
