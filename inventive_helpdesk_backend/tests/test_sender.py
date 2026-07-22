@@ -93,6 +93,65 @@ class TestSenderClassification(IntegrationTestCase):
         )
 
 
+    def test_inviting_a_primary_contact_also_refreshes_agent_logged_tickets(self):
+        """The half `from_email` cannot see.
+
+        An agent-logged ticket carries no from_email at all — its reply address is
+        resolved through the division's primary POC. Filtering the refresh on from_email
+        missed every one of those, so inviting a division's main contact left their tickets
+        badged "Known Contact" indefinitely.
+        """
+        from inventive_helpdesk_backend.api import invite_poc
+
+        client = _ensure("Client", {"client_name": "Fallback Co", "client_code": "FBK"})
+        division = _ensure(
+            "Division", {"division_name": "Fallback Div", "division_code": "FBD", "client": client}
+        )
+        poc = _poc(client, division, "primary.contact@example.test", with_login=False)
+        frappe.db.set_value("POC", poc, "is_primary", 1)
+
+        t = frappe.get_doc({
+            "doctype": "Support Ticket", "title": "Agent logged", "description": "x",
+            "ticket_type": "Query", "priority": "Low", "status": "New",
+            "client": client, "division": division,
+        }).insert(ignore_permissions=True)
+        self.assertIsNone(t.from_email, "vacuous test: this ticket must have no from_email")
+        self.assertEqual(t.sender_kind, sender.KNOWN_CONTACT)
+
+        invite_poc(poc)
+
+        self.assertEqual(
+            frappe.db.get_value("Support Ticket", t.name, "sender_kind"), sender.REGISTERED
+        )
+
+
+class TestReplyAddressHasOneImplementation(IntegrationTestCase):
+    """Transport and classification must resolve the same address.
+
+    email._ticket_contact_email was a second copy of sender.reply_address's fallback chain.
+    They agreed, but nothing kept them agreeing — and if they drifted a ticket could be
+    badged "Registered" while the mail went somewhere else entirely.
+    """
+
+    def test_email_delegates_rather_than_duplicating(self):
+        client = _ensure("Client", {"client_name": "OneImpl Co", "client_code": "ONE"})
+        division = _ensure(
+            "Division", {"division_name": "OneImpl Div", "division_code": "OID", "client": client}
+        )
+        _poc(client, division, "oneimpl.primary@example.test", with_login=False)
+        frappe.db.set_value("POC", "oneimpl.primary@example.test", "is_primary", 1)
+
+        for kw in (
+            {"from_email": "direct@example.test"},
+            {"client": client, "division": division},  # resolved via the division fallback
+        ):
+            with self.subTest(kw=kw):
+                t = frappe.get_doc({
+                    "doctype": "Support Ticket", "title": "One impl", "description": "x",
+                    "ticket_type": "Query", "priority": "Low", "status": "New", **kw,
+                }).insert(ignore_permissions=True)
+                self.assertEqual(helpdesk_email._ticket_contact_email(t), sender.reply_address(t))
+
 class TestNoReplyDetection(IntegrationTestCase):
     """Detection is advisory: it never stops a ticket being created, so a false positive
     costs a warning badge rather than a customer's request."""
@@ -114,19 +173,50 @@ class TestNoReplyDetection(IntegrationTestCase):
         for who in ("a.real.person@example.test", "noreply@vendor.test"):
             frappe.cache().delete(helpdesk_email._ack_key(who))
 
-    def test_conventional_unmonitored_mailboxes(self):
+    def test_addresses_that_announce_they_take_no_replies(self):
+        # The built-ins cover only these — a mailbox whose own name says replies go
+        # nowhere. Anything requiring a judgement call is an operator rule instead; see
+        # test_plausible_shared_mailboxes_are_left_alone for why.
         for email in (
-            "noreply@vendor.test", "no-reply@sap.test", "donotreply@bank.test",
-            "notifications@github.test", "alerts@monitor.test", "automated@erp.test",
+            "noreply@vendor.test", "no-reply@sap.test", "no_reply@sap.test",
+            "donotreply@bank.test", "do-not-reply@bank.test",
+            "bounce@list.test", "bounces@list.test", "automailer@erp.test",
         ):
             with self.subTest(email=email):
                 self.assertIsNotNone(sender.no_reply_reason(email))
+
+    def test_an_operator_rule_covers_what_the_built_ins_deliberately_miss(self):
+        # The escape hatch that makes the narrow built-ins safe: a customer whose
+        # `alerts@` really is unmonitored is one record away from being handled.
+        self.assertIsNone(sender.no_reply_reason("alerts@monitor.test"))
+        frappe.get_doc({
+            "doctype": "No Reply Rule", "pattern": "alerts@monitor.test",
+            "match_type": "Exact", "enabled": 1, "note": "confirmed unmonitored",
+        }).insert(ignore_permissions=True)
+        sender.clear_rule_cache()
+        self.assertIsNotNone(sender.no_reply_reason("alerts@monitor.test"))
+        frappe.db.delete("No Reply Rule", {"pattern": "alerts@monitor.test"})
 
     def test_a_real_person_is_not_matched(self):
         # Whole-local-part matching, not a substring. "noreply.patel@" is a person.
         for email in (
             "r.mehta@thermax.test", "noreply.patel@thermax.test",
             "alerts.manager@thermax.test", "system.admin@thermax.test",
+        ):
+            with self.subTest(email=email):
+                self.assertIsNone(sender.no_reply_reason(email))
+
+    def test_plausible_shared_mailboxes_are_left_alone(self):
+        """The built-ins only match addresses that announce they take no replies.
+
+        `alerts@` and `system@` at a customer's own domain are plausibly monitored, and
+        guessing wrong is not cosmetic: a No Reply classification also withholds the
+        acknowledgement, so the sender emails in and hears nothing — no ticket ID at all.
+        Anything less than certain belongs in a No Reply Rule.
+        """
+        for email in (
+            "alerts@thermax.test", "notifications@thermax.test",
+            "system@thermax.test", "mailer@thermax.test", "automated@thermax.test",
         ):
             with self.subTest(email=email):
                 self.assertIsNone(sender.no_reply_reason(email))

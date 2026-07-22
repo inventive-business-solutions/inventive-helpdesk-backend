@@ -36,24 +36,16 @@ def _support_inbox():
 
 
 def _ticket_contact_email(ticket):
-    """The client's email for acks/replies. Email tickets carry ``from_email``; portal
-    tickets are owned by the raising POC (their login IS their email); agent-raised tickets
-    fall back to the POC named on the ticket, then the division's primary POC."""
-    if getattr(ticket, "from_email", None):
-        return (ticket.from_email or "").strip().lower() or None
-    owner = getattr(ticket, "owner", None)
-    if owner and owner not in ("Administrator", "Guest") and frappe.db.exists("POC", {"user": owner}):
-        return owner.strip().lower()
-    div, raised_by = getattr(ticket, "division", None), getattr(ticket, "raised_by", None)
-    if div and raised_by:
-        email = frappe.db.get_value("POC", {"division": div, "poc_name": raised_by}, "email")
-        if email:
-            return email.strip().lower()
-    if div:
-        email = frappe.db.get_value("POC", {"division": div, "is_primary": 1}, "email")
-        if email:
-            return email.strip().lower()
-    return None
+    """The client's email for acks/replies.
+
+    One implementation, in sender.py. This was a second copy of the same fallback chain,
+    which is a drift hazard for nothing: the address transport sends to and the address
+    classification is computed from MUST be the same, or a ticket could be badged
+    "Registered" while mail went somewhere else entirely.
+    """
+    from inventive_helpdesk_backend import sender
+
+    return sender.reply_address(ticket)
 
 
 def _portal_ticket_url(ticket_name):

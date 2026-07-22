@@ -602,7 +602,7 @@ def invite_poc(poc):
     # next saved. Bounded by one contact's tickets.
     from inventive_helpdesk_backend import sender
 
-    sender.refresh_for_email(doc.email)
+    sender.refresh_for_poc(doc.name)
 
     return {"user": user.name, "email_sent": _send_invite_mail(user, "POC portal")}
 

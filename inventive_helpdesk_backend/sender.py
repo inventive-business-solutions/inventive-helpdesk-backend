@@ -25,15 +25,22 @@ KNOWN_CONTACT = "Known Contact"
 UNREGISTERED = "Unregistered"
 NO_REPLY = "No Reply"
 
-# Layer 2 of no-reply detection: local-parts that are unmonitored by convention. Matched
-# on the WHOLE local part, so a real person at `noreply.patel@` is untouched.
+# Layer 2 of no-reply detection: local-parts that are unmonitored BY CONSTRUCTION — the
+# address itself announces that replies go nowhere. Matched on the WHOLE local part, so a
+# real person at `noreply.patel@` is untouched.
 #
-# `mailer-daemon` and `postmaster` are deliberately absent — those are bounce
+# Deliberately narrow. `alerts@`, `notifications@`, `system@` and `mailer@` were here and
+# have been removed: at a customer's own domain those are plausibly monitored shared
+# mailboxes, and the cost of guessing wrong is not cosmetic. A No Reply classification also
+# withholds the acknowledgement, so a false positive means the customer emails in and hears
+# nothing at all — no ticket ID, no confirmation. Anything less than certain belongs in a
+# No Reply Rule, where an operator who knows their customers decides.
+#
+# `mailer-daemon` and `postmaster` are absent for a different reason: they are bounce
 # infrastructure, and email._is_bounce files their mail onto the originating ticket rather
 # than letting it become one.
 _NO_REPLY_LOCALPART = re.compile(
-    r"^(?:no-?reply|do-?not-?reply|donotreply|noreply|bounce|bounces|automated|auto-?mailer"
-    r"|notification|notifications|alerts?|mailer|system)$",
+    r"^(?:no[-_]?reply|do[-_]?not[-_]?reply|bounces?|auto[-_]?mailer)$",
     re.I,
 )
 
@@ -75,8 +82,10 @@ def no_reply_reason(email: str) -> str | None:
     Returns a human sentence, not a boolean, so the UI badge can explain itself and an
     operator can tell a configured rule from a built-in guess.
 
-    Deliberately advisory. Nothing here stops a ticket being created or read — a false
-    positive costs a warning badge, never a lost request.
+    A match never stops a ticket being created or read. It does two things: it badges the
+    ticket, and it withholds the automatic acknowledgement — so a false positive DOES cost
+    the sender their ticket ID. That asymmetry is why the built-in patterns below are
+    narrow and the operator rules exist.
     """
     email = (email or "").strip().lower()
     if not email or "@" not in email:
@@ -183,15 +192,35 @@ def refresh(ticket_name: str) -> None:
         )
 
 
-def refresh_for_email(email: str) -> int:
-    """Re-classify every ticket whose reply address is `email`. Returns the count.
+def refresh_for_poc(poc_name: str) -> int:
+    """Re-classify every ticket whose reply address resolves to this POC. Returns the count.
 
-    Bounded by one contact's tickets, so it is safe to run inline from the invite path.
+    Two sets, because `reply_address` has a fallback chain and only the first leaves a
+    trace on the ticket:
+
+    1. Tickets that name the address directly in `from_email` — email intake.
+    2. Tickets in the POC's division with NO `from_email` — agent-logged ones, whose reply
+       address is resolved through `raised_by` or the division's primary POC. Filtering on
+       `from_email` alone missed every one of these, so inviting a division's primary
+       contact left their agent-logged tickets showing a stale "Known Contact" badge.
+
+    Both sets are bounded (one contact, one division), so this is safe inline on invite.
     """
-    email = (email or "").strip().lower()
-    if not email:
+    poc = frappe.db.get_value("POC", poc_name, ["email", "division"], as_dict=True)
+    if not poc or not poc.email:
         return 0
-    names = frappe.get_all("Support Ticket", filters={"from_email": email}, pluck="name", limit=2000)
+    email = poc.email.strip().lower()
+
+    names = set(frappe.get_all("Support Ticket", filters={"from_email": email}, pluck="name", limit=2000))
+    if poc.division:
+        names.update(
+            frappe.get_all(
+                "Support Ticket",
+                filters={"division": poc.division, "from_email": ["in", ["", None]]},
+                pluck="name",
+                limit=2000,
+            )
+        )
     for name in names:
         refresh(name)
     return len(names)
