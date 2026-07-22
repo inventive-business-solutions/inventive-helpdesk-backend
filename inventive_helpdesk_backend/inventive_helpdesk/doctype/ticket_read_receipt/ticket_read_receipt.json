@@ -1,0 +1,63 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "autoname": "hash",
+ "creation": "2026-07-22 18:30:00.000000",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "ticket",
+  "user",
+  "read_on"
+ ],
+ "fields": [
+  {
+   "fieldname": "ticket",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Ticket",
+   "options": "Support Ticket",
+   "reqd": 1,
+   "search_index": 1
+  },
+  {
+   "fieldname": "user",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "User",
+   "options": "User",
+   "reqd": 1,
+   "search_index": 1
+  },
+  {
+   "fieldname": "read_on",
+   "fieldtype": "Datetime",
+   "in_list_view": 1,
+   "label": "Read On",
+   "reqd": 1
+  }
+ ],
+ "grid_page_length": 50,
+ "index_web_pages_for_search": 0,
+ "links": [],
+ "modified": "2026-07-22 18:30:00.000000",
+ "modified_by": "Administrator",
+ "module": "Inventive Helpdesk",
+ "name": "Ticket Read Receipt",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "read": 1,
+   "role": "Support Team",
+   "write": 1
+  }
+ ],
+ "row_format": "Dynamic",
+ "rows_threshold_for_grid_search": 20,
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": []
+}

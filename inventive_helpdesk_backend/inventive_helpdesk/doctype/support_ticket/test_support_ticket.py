@@ -278,6 +278,24 @@ class TestSupportTicket(IntegrationTestCase):
         self.assertEqual(served.get("name"), ta.name)  # tenant scope allows the read
         self.assertFalse(served.get("notes"), "internal work notes leaked to a client read")
 
+    def test_activity_log_stripped_from_client_read(self):
+        # Same contract as the work notes above, for the activity log: a client may
+        # read their own ticket but must never learn who it was passed between or
+        # when its priority was raised. Drives the real read path rather than just
+        # asserting the permlevel, so a DocPerm change can't quietly open it up.
+        from frappe.client import get as client_get
+
+        ta = make_ticket(client=self.client_a, division=self.div_a)
+        ta.status = "In Progress"
+        ta.save(ignore_permissions=True)
+        # Guard against a vacuous test: the log really is populated on the ticket.
+        self.assertTrue(frappe.get_doc("Support Ticket", ta.name).activity)
+
+        frappe.set_user(self.poc_a)
+        served = client_get("Support Ticket", ta.name)
+        self.assertEqual(served.get("name"), ta.name)
+        self.assertFalse(served.get("activity"), "ticket activity log leaked to a client read")
+
     def test_client_can_message_own_ticket_only(self):
         ta = make_ticket(client=self.client_a, division=self.div_a)
         tb = make_ticket(client=self.client_b, division=self.div_b)

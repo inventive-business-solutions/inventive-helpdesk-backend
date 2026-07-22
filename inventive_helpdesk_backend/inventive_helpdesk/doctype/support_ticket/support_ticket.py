@@ -2,13 +2,39 @@ import frappe
 from frappe import _
 from frappe.model.document import Document
 from frappe.model.naming import getseries
-from frappe.utils import parse_addr
+from frappe.utils import now_datetime, parse_addr
 
 from inventive_helpdesk_backend.permissions import TEAM_ROLES
 
 
 def _slug(value: str) -> str:
     return "".join(ch for ch in (value or "").upper() if ch.isalnum())[:3] or "XXX"
+
+
+# ---- activity log ---------------------------------------------------------
+# Ticket fields whose changes are recorded, mapped to the label shown in the UI.
+# Deliberately just the four that change hands — description/title edits would
+# bury the handovers this log exists to surface.
+_TRACKED_FIELDS = {
+    "status": "Status",
+    "priority": "Priority",
+    "assignee": "Assignee",
+    "assignment_group": "Team",
+}
+# Link fields read better as "Unassigned" than as a blank cell.
+_EMPTY_LABEL = {"assignee": "Unassigned", "assignment_group": "Unassigned"}
+
+
+def _actor() -> str:
+    """Display name of whoever is making the change. Mirrors api._author(); kept
+    local so the doctype doesn't depend on the API layer."""
+    return frappe.db.get_value("User", frappe.session.user, "full_name") or frappe.session.user
+
+
+def _display(fieldname: str, value) -> str:
+    if isinstance(value, str):
+        value = value.strip()
+    return str(value) if value else _EMPTY_LABEL.get(fieldname, "—")
 
 
 class SupportTicket(Document):
@@ -86,6 +112,56 @@ class SupportTicket(Document):
         # assignment_group) or inject staff-labelled conversation rows. Staff creations are
         # trusted and email intake owns its own fields above — clamp only client authorship.
         self._clamp_client_authored_fields()
+
+    def before_save(self):
+        """Record who changed what, in the same write as the change itself.
+
+        This lives on the document rather than in the API layer because the frontend
+        edits status/priority/assignment straight over the REST resource endpoint
+        (store.setStatus and friends call updateDoc → PUT). There is no whitelisted
+        method to instrument, and a desk edit, a script or a hand-rolled REST call
+        would bypass one anyway — so the only place the log cannot be dodged is here.
+
+        Appending in before_save (not on_update) matters twice over: get_doc_before_save
+        is already loaded by check_if_latest, and the rows go down with the parent, so
+        there is no second save() — no recursion, and no ticket can ever be saved with
+        its change missing from the log.
+
+        Ordering note: validate_higher_perm_levels() runs before this (document.py:476),
+        which resets the permlevel-1 `activity` field to its stored value for anyone
+        without permlevel-1 write. A client POC therefore cannot inject rows through a
+        crafted payload, while rows appended here still persist.
+        """
+        # Bulk/system runs must not manufacture history. in_test is deliberately NOT
+        # in this set — the tests assert on exactly this behaviour.
+        if frappe.flags.in_install or frappe.flags.in_migrate or frappe.flags.in_import:
+            return
+
+        author, when = _actor(), now_datetime()
+        before = self.get_doc_before_save()
+        if before is None:
+            # New ticket. One row, so the log opens with an origin rather than a
+            # burst of "changed from nothing" lines for every tracked field.
+            self.append("activity", {
+                "action": "Created",
+                "new_value": _display("status", self.status),
+                "author": author,
+                "acted_on": when,
+            })
+            return
+
+        for fieldname, label in _TRACKED_FIELDS.items():
+            old, new = before.get(fieldname), self.get(fieldname)
+            # Normalise "" / None so clearing an empty link isn't logged as a change.
+            if (old or None) == (new or None):
+                continue
+            self.append("activity", {
+                "action": label,
+                "old_value": _display(fieldname, old),
+                "new_value": _display(fieldname, new),
+                "author": author,
+                "acted_on": when,
+            })
 
     def _clamp_client_authored_fields(self):
         """Force safe values on a ticket a client POC creates directly, so a hand-crafted

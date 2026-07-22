@@ -81,8 +81,12 @@ def me():
     # Resolve by the User link, never by display name — assignee stores the docname
     # while `name` above is the User's full name, and the two can differ.
     if _is_team(user):
-        member = frappe.db.get_value("Team Member", {"user": user}, "name")
+        row = frappe.db.get_value("Team Member", {"user": user}, ["name", "title"], as_dict=True)
+        member = row.name if row else None
         ctx["member"] = member
+        # Job title (e.g. "Business Development Executive") — free text, often unset;
+        # the frontend falls back to a generic label when it's blank.
+        ctx["title"] = (row.title or "").strip() if row else ""
         ctx["teams"] = (
             [r.parent for r in frappe.get_all(
                 "Assignment Group Member", filters={"member": member}, fields=["parent"])]
@@ -117,7 +121,10 @@ def add_message(ticket: str, body: str, attachments=None):
         "body": body,
         "attachments": _norm_attachments(attachments),
     })
+    doc.last_activity_on = now_datetime()
     doc.save(ignore_permissions=True)
+    # You are not "unread" on your own message.
+    _mark_read(doc.name)
     # A staff member's client-visible reply → email it to the client with a portal link so
     # email-only clients see it and can jump back in to continue the conversation.
     if team:
@@ -144,7 +151,9 @@ def add_note(ticket: str, body: str, attachments=None):
         "body": body,
         "attachments": _norm_attachments(attachments),
     })
+    doc.last_activity_on = now_datetime()
     doc.save(ignore_permissions=True)
+    _mark_read(doc.name)
     return doc.name
 
 
@@ -159,15 +168,85 @@ def reopen(ticket: str):
     return doc.name
 
 
+# ---- unread markers -------------------------------------------------------
+# A ticket is unread for an agent when something was SAID on it — a client message or an
+# internal note — since that agent last opened it. Tracked per user rather than per ticket
+# so one member reading a client reply doesn't clear the marker for the rest of the team.
+def _mark_read(ticket: str, user: str | None = None):
+    """Stamp (ticket, user) as read now. Upsert: one row per pair, ever."""
+    user = user or frappe.session.user
+    if user in ("Administrator", "Guest"):
+        return
+    name = frappe.db.get_value("Ticket Read Receipt", {"ticket": ticket, "user": user})
+    if name:
+        frappe.db.set_value("Ticket Read Receipt", name, "read_on", now_datetime())
+    else:
+        frappe.get_doc({
+            "doctype": "Ticket Read Receipt",
+            "ticket": ticket,
+            "user": user,
+            "read_on": now_datetime(),
+        }).insert(ignore_permissions=True)
+
+
+@frappe.whitelist()
+def unread_tickets():
+    """Ticket names with activity this agent hasn't seen. Staff only.
+
+    Read scope still applies: this only reports names, and the ticket bodies come from the
+    normal permission-checked list fetch, so a name here can never expose a ticket the
+    caller couldn't already read."""
+    _require_team()
+    user = frappe.session.user
+    rows = frappe.get_all(
+        "Support Ticket",
+        filters={"last_activity_on": ["is", "set"]},
+        fields=["name", "last_activity_on"],
+    )
+    if not rows:
+        return []
+    seen = {
+        r.ticket: r.read_on
+        for r in frappe.get_all(
+            "Ticket Read Receipt",
+            filters={"user": user, "ticket": ["in", [r.name for r in rows]]},
+            fields=["ticket", "read_on"],
+        )
+    }
+    # No receipt at all => never opened => unread.
+    return [r.name for r in rows if not seen.get(r.name) or seen[r.name] < r.last_activity_on]
+
+
+@frappe.whitelist(methods=["POST"])
+def mark_ticket_read(ticket: str):
+    """Called when an agent opens a ticket. Staff only."""
+    _require_team()
+    _require_read(ticket)
+    _mark_read(ticket)
+    return ticket
+
+
 def _my_member() -> str:
     """The signed-in staff user's Team Member docname (or None). Resolved by the
     User link, matching how tickets store `assignee`."""
     return frappe.db.get_value("Team Member", {"user": frappe.session.user}, "name")
 
 
-def _log_note(doc, body: str):
-    """Append an internal audit line to the ticket's work-note thread."""
-    doc.append("notes", {"author": _author(), "note_on": now_datetime(), "body": body})
+def _log_activity(doc, action: str, old=None, new=None):
+    """Append a row to the ticket's activity log.
+
+    Only for events the field diff in SupportTicket.before_save cannot see — i.e.
+    collaborator add/remove, which are child-table changes rather than scalar fields.
+    Scalar changes (status, priority, assignee, team) are recorded by the hook, so
+    logging them here too would double up. The caller saves; this only appends, so
+    the row lands in the same write as the change."""
+    doc.append("activity", {
+        "action": action,
+        "old_value": old,
+        "new_value": new,
+        "author": _author(),
+        "acted_on": now_datetime(),
+    })
 
 
 @frappe.whitelist(methods=["POST"])
@@ -191,7 +270,8 @@ def claim_ticket(ticket: str):
     doc.assignee = member
     if doc.status == "New":
         doc.status = "Acknowledged"
-    _log_note(doc, _("Claimed by {0}").format(_author()))
+    # No explicit log line: before_save records the assignee (and status) change, and
+    # the UI reads a self-assignment — author == the new assignee — as "claimed".
     doc.save(ignore_permissions=True)
     return doc.name
 
@@ -229,7 +309,7 @@ def add_collaborator(ticket: str, party_type: str, party: str):
         "added_by": _author(),
         "added_on": now_datetime(),
     })
-    _log_note(doc, _("Added collaborator: {0}").format(party))
+    _log_activity(doc, "Collaborator", new=party)
     doc.save(ignore_permissions=True)
     return doc.name
 
@@ -245,7 +325,7 @@ def remove_collaborator(ticket: str, party_type: str, party: str):
     if len(remaining) == len(rows):
         frappe.throw(_("{0} is not a collaborator on this ticket").format(party))
     doc.set("collaborators", remaining)
-    _log_note(doc, _("Removed collaborator: {0}").format(party))
+    _log_activity(doc, "Collaborator", old=party)
     doc.save(ignore_permissions=True)
     return doc.name
 

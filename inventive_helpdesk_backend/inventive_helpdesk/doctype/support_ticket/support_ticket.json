@@ -19,6 +19,7 @@
   "sec_sla",
   "due_date",
   "sla_risk",
+  "last_activity_on",
   "col2",
   "source",
   "from_email",
@@ -30,7 +31,9 @@
   "sec_collaborators",
   "collaborators",
   "sec_notes",
-  "notes"
+  "notes",
+  "sec_activity",
+  "activity"
  ],
  "fields": [
   {
@@ -115,6 +118,13 @@
    "label": "SLA Risk"
   },
   {
+   "description": "When a client message or an internal note was last added. Compared against Ticket Read Receipt.read_on to decide whether this ticket is unread for a given agent. Deliberately NOT bumped by field edits (status, priority, assignment) — those are recorded in the activity log, and marking a ticket unread every time someone re-prioritises it would make the indicator meaningless.",
+   "fieldname": "last_activity_on",
+   "fieldtype": "Datetime",
+   "label": "Last Activity On",
+   "read_only": 1
+  },
+  {
    "fieldname": "col2",
    "fieldtype": "Column Break"
   },
@@ -182,6 +192,21 @@
    "label": "Work Notes",
    "options": "Work Note",
    "permlevel": 1
+  },
+  {
+   "fieldname": "sec_activity",
+   "fieldtype": "Section Break",
+   "label": "Activity",
+   "permlevel": 1
+  },
+  {
+   "description": "Append-only record of who changed what on this ticket. Written server-side by SupportTicket.before_save (tracked fields) and inventive_helpdesk_backend.api (collaborator events) — never by the client. permlevel 1 keeps it off every client POC response, exactly like the work notes above.",
+   "fieldname": "activity",
+   "fieldtype": "Table",
+   "label": "Activity",
+   "options": "Ticket Activity",
+   "permlevel": 1,
+   "read_only": 1
   }
  ],
  "grid_page_length": 50,
