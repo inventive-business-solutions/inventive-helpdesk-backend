@@ -357,17 +357,26 @@ class TestSupportTicket(IntegrationTestCase):
         with self.assertRaises(frappe.ValidationError):
             _ensure_login_user(POC_A_EMAIL, "Test POC", "System User", "Support Team")
 
-    # ---- hardening: guest email webhook is inert outside developer mode (H1) ----
-    def test_receive_webhook_blocked_outside_developer_mode(self):
-        from inventive_helpdesk_backend.email import receive_webhook
-
-        original = frappe.conf.get("developer_mode")
+    # ---- hardening: Guest gets no exemption from the field clamp ----
+    def test_guest_is_not_exempt_from_the_client_clamp(self):
+        # Guest used to be exempt, for a dev-only inbound webhook that ran unauthenticated.
+        # That webhook has been removed, so no legitimate path inserts a ticket as Guest
+        # and the exemption would only mean an unauthenticated insert went unclamped.
+        t = frappe.get_doc({
+            "doctype": "Support Ticket",
+            "title": "Guest attempt", "description": "x", "ticket_type": "Query",
+            "priority": "Low", "status": "Resolved",
+            "client": self.client_a, "division": self.div_a,
+            "from_email": "attacker@example.test",
+        })
+        frappe.set_user("Guest")
         try:
-            frappe.conf.developer_mode = 0
-            with self.assertRaises(frappe.PermissionError):
-                receive_webhook()
+            t._clamp_client_authored_fields()
         finally:
-            frappe.conf.developer_mode = original
+            frappe.set_user("Administrator")
+        self.assertEqual(t.status, "New")
+        self.assertIsNone(t.from_email)
+        self.assertEqual(t.source, "Portal")
 
     # ---- hardening: ticket attachments are private + tenant-scoped (upload_attachment) ----
     def test_attachment_is_private_and_ticket_scoped(self):

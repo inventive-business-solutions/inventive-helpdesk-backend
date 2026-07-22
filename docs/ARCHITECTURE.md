@@ -203,8 +203,6 @@ rolled back rather than committed.
 | --- | --- | --- |
 | GET | `me` | Role, tenant scope, CSRF token. **GET by design** — it must work before a CSRF token is held, right after login. |
 | GET | `check` | Health + `build_sha`. Guest-callable; used by CI to verify a deploy is running the expected commit. |
-| POST | `receive_webhook` | Mailpit intake. Guest-callable but **developer-mode only** — inert in production. |
-| POST | `send_test_email` | Dev-only, staff-only. |
 
 ---
 
@@ -277,7 +275,3 @@ because it creates users with fixed passwords:
 ```bash
 bench --site helpdesk.localhost execute inventive_helpdesk_backend.seed.run
 ```
-
-`email.py` also carries a Mailpit-based inbound simulator (`receive_webhook`,
-`send_test_email`) for exercising the real email→ticket pipeline locally. Both are
-developer-mode gated and inert in production.

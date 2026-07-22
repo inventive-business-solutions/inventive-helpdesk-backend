@@ -1,10 +1,8 @@
 """Inbound-email intake + outbound client notifications for Inventive Helpdesk.
 
-Inbound (two transports, one intake):
-- Production: a real incoming Email Account (IMAP/POP3) creates a Communication per
-  received email; ``on_communication`` opens a ticket from it.
-- Local dev: Mailpit POSTs a webhook per captured message; ``receive_webhook`` opens one.
-Both ignore our own outgoing mail (From = the support inbox), so there's no feedback loop.
+Inbound: a real incoming Email Account (IMAP) creates a Communication per received email,
+and ``on_communication`` either appends it to the ticket it belongs to or opens a new one.
+Our own outgoing mail (From = the support inbox) is ignored, so there's no feedback loop.
 
 Outbound (to the client):
 - ``send_ticket_ack`` (Support Ticket after_insert) — acknowledges every CLIENT-initiated
@@ -557,89 +555,6 @@ def _append_ticket_attachments(ticket_name, refs):
         json.dumps(current + added),
         update_modified=False,
     )
-
-
-@frappe.whitelist(allow_guest=True, methods=["POST"])
-def receive_webhook():
-    """Local dev intake: Mailpit POSTs here for every captured message. Turn inbound support
-    emails (addressed to the support inbox, not from us) into tickets. Guest-callable because
-    Mailpit is a local, unauthenticated sink — a DEV convenience; production uses a real Email
-    Account + on_communication, not this endpoint."""
-    # Guest-callable and DEV-ONLY: Mailpit is a local, unauthenticated sink. Outside
-    # developer mode this must be inert — production intake is a real Email Account +
-    # on_communication. Left open it lets an unauthenticated caller inject a ticket into
-    # any client's scope (before_insert scopes by the attacker-supplied From address).
-    if not frappe.conf.get("developer_mode"):
-        raise frappe.PermissionError("receive_webhook is available only in developer mode")
-    raw = frappe.request.get_data(as_text=True) if frappe.request else "{}"
-    try:
-        data = json.loads(raw or "{}")
-    except ValueError:
-        return {"created": []}
-    msgs = data if isinstance(data, list) else [data]
-    inbox = _support_inbox()
-    created = []
-    for m in msgs:
-        if not isinstance(m, dict):
-            continue
-        recipients = [(a.get("Address") or "").lower() for a in (m.get("To") or []) + (m.get("Cc") or [])]
-        if inbox and inbox not in recipients:
-            continue  # not addressed to our support inbox — ignore
-        sender = ((m.get("From") or {}).get("Address") or "").strip()
-        body = _fetch_mailpit_body(m.get("ID")) or m.get("Snippet") or ""
-        name = _open_ticket_from_email(sender, m.get("Subject"), body)
-        if name:
-            created.append(name)
-    if created:
-        frappe.db.commit()
-    return {"created": created}
-
-
-def _fetch_mailpit_body(message_id):
-    """Full plain-text body of a captured Mailpit message (the webhook payload only carries a
-    snippet). Best-effort; falls back to the snippet on any error."""
-    if not message_id:
-        return ""
-    try:
-        import requests
-        base = (frappe.conf.get("mailpit_api") or "http://localhost:8025").rstrip("/")
-        r = requests.get(f"{base}/api/v1/message/{message_id}", timeout=5)
-        if r.ok:
-            return (r.json() or {}).get("Text") or ""
-    except Exception:
-        frappe.log_error(title="Mailpit body fetch failed")
-    return ""
-
-
-@frappe.whitelist(methods=["POST"])
-def send_test_email(from_email, subject=None, body=None, from_name=None):
-    """DEV-ONLY, staff-only: inject a test email into Mailpit via its send API so it flows
-    through the REAL inbound pipeline (Mailpit captures it -> fires the webhook ->
-    receive_webhook -> ticket). Lets the team watch a ticket arrive from an actual email,
-    unlike the direct in-app simulator. Not for production (there is no Mailpit there)."""
-    if not frappe.conf.get("developer_mode"):
-        raise frappe.PermissionError("send_test_email is available only in developer mode")
-    if not (set(frappe.get_roles()) & TEAM_ROLES):
-        raise frappe.PermissionError("Only support staff can send a test email")
-    sender = (from_email or "").strip()
-    if not sender:
-        frappe.throw("A sender email address is required")
-    to = _support_inbox() or "helpdesk@inventivebizsol.com"
-    base = (frappe.conf.get("mailpit_api") or "http://localhost:8025").rstrip("/")
-    payload = {
-        "From": {"Email": sender, "Name": (from_name or "").strip() or sender},
-        "To": [{"Email": to}],
-        "Subject": (subject or "").strip() or "(no subject)",
-        "Text": (body or "").strip() or "(no message)",
-    }
-    import requests
-
-    try:
-        resp = requests.post(f"{base}/api/v1/send", json=payload, timeout=5)
-        resp.raise_for_status()
-    except requests.RequestException as exc:
-        frappe.throw(f"Could not reach Mailpit at {base} — is it running? ({exc})")
-    return {"to": to, "sender": sender}
 
 
 # ---- outbound: acknowledgement + reply notifications ----------------------

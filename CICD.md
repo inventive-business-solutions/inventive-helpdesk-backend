@@ -195,8 +195,8 @@ Then create an **Email Account** (outgoing, `default_outgoing=1`) in the Frappe 
 Until one exists, `invite_poc` / `invite_member` create the account and return
 `email_sent: false` without raising — invites will silently send nothing.
 
-Leave `developer_mode` **off** (the default). It gates the guest-callable
-`receive_webhook` and `send_test_email` endpoints, which must stay inert outside local dev.
+Leave `developer_mode` **off** (the default). It exposes developer tooling and more
+verbose errors, neither of which belongs on a production site.
 
 ---
 
