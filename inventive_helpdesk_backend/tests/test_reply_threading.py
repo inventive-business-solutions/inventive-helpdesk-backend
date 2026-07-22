@@ -1,6 +1,7 @@
 # Copyright (c) 2026, Inventive Business Solutions Pvt Ltd and Contributors
 # See license.txt
 
+import json
 import time
 
 import frappe
@@ -195,6 +196,132 @@ class TestReplyThreading(IntegrationTestCase):
 
         t.reload()
         self.assertEqual(len(t.conversation), 0, "our own outgoing mail must not echo into the thread")
+
+
+class TestInboundAttachments(IntegrationTestCase):
+    """A file a customer emails in has to end up ON the ticket.
+
+    Frappe attaches inbound files to the Communication (receive.py:632-645), and it does
+    so AFTER inserting it — so the after_insert hook that handles the body sees no files
+    at all. "Here's a screenshot of the error" is routine for after-sales support, and it
+    used to leave the agent reading a body referring to a file the ticket did not have.
+    """
+
+    def setUp(self):
+        self.client = _ensure("Client", {"client_name": "Attach Co", "client_code": "ATT"})
+        self.division = _ensure(
+            "Division", {"division_name": "Attach Div", "division_code": "ADV", "client": self.client}
+        )
+        self.ticket = frappe.get_doc({
+            "doctype": "Support Ticket",
+            "title": "Attachment fixture", "description": "x", "ticket_type": "Query",
+            "priority": "Low", "status": "New",
+            "client": self.client, "division": self.division,
+        }).insert(ignore_permissions=True)
+
+    def _received(self):
+        return frappe.get_doc({
+            "doctype": "Communication",
+            "communication_type": "Communication", "communication_medium": "Email",
+            "sent_or_received": "Received", "subject": "with a file",
+            "sender": "someone@example.test", "content": "see attached",
+            "reference_doctype": "Support Ticket", "reference_name": self.ticket.name,
+        }).insert(ignore_permissions=True)
+
+    def _attach_to(self, comm, name="screenshot.png", content=b"not-really-a-png"):
+        return frappe.get_doc({
+            "doctype": "File", "file_name": name,
+            "attached_to_doctype": "Communication", "attached_to_name": comm.name,
+            "is_private": 1, "content": content,
+        }).insert(ignore_permissions=True)
+
+    def test_an_emailed_file_lands_on_the_ticket(self):
+        comm = self._received()
+        self._attach_to(comm)
+        helpdesk_email.on_communication_update(comm)
+
+        moved = frappe.get_all(
+            "File",
+            filters={"attached_to_doctype": "Support Ticket", "attached_to_name": self.ticket.name},
+            fields=["file_name", "is_private"],
+        )
+        self.assertEqual([f.file_name for f in moved], ["screenshot.png"])
+        self.assertEqual(moved[0].is_private, 1, "an emailed file must not become world-readable")
+
+        listed = json.loads(frappe.db.get_value("Support Ticket", self.ticket.name, "attachments") or "[]")
+        self.assertEqual([r["name"] for r in listed], ["screenshot.png"],
+                         "the file moved but the ticket does not list it, so the portal won't show it")
+
+    def test_the_owning_client_can_read_it_and_a_foreign_one_cannot(self):
+        """The reason this re-parents rather than copies.
+
+        File.has_permission delegates to whatever the file is attached to
+        (frappe/core/doctype/file/file.py:967). On a Communication that means a client POC
+        cannot read their OWN attachment — clients have no Communication access at all. On
+        the ticket it inherits the tenant isolation already enforced there, so the right
+        client gains access and the wrong one still has none."""
+        comm = self._received()
+        f = self._attach_to(comm)
+
+        mine = _poc_for(self.client, self.division, "attach.poc@example.test")
+        other_client = _ensure("Client", {"client_name": "Attach Rival", "client_code": "ATR"})
+        other_div = _ensure(
+            "Division",
+            {"division_name": "Rival Div", "division_code": "RVD", "client": other_client},
+        )
+        theirs = _poc_for(other_client, other_div, "rival.poc@example.test")
+
+        frappe.set_user(mine)
+        self.assertFalse(
+            frappe.get_doc("File", f.name).has_permission("read"),
+            "vacuous test: the owning client could already read it before re-parenting",
+        )
+        frappe.set_user("Administrator")
+
+        helpdesk_email.on_communication_update(comm)
+
+        frappe.set_user(mine)
+        self.assertTrue(
+            frappe.get_doc("File", f.name).has_permission("read"),
+            "the client this ticket belongs to still cannot download their own attachment",
+        )
+        frappe.set_user(theirs)
+        self.assertFalse(
+            frappe.get_doc("File", f.name).has_permission("read"),
+            "another client can read an attachment on a ticket that is not theirs",
+        )
+        frappe.set_user("Administrator")
+
+    def test_running_twice_does_not_duplicate(self):
+        # on_update fires more than once per Communication.
+        comm = self._received()
+        self._attach_to(comm)
+        helpdesk_email.on_communication_update(comm)
+        helpdesk_email.on_communication_update(comm)
+        listed = json.loads(frappe.db.get_value("Support Ticket", self.ticket.name, "attachments") or "[]")
+        self.assertEqual(len(listed), 1)
+
+    def test_our_own_outgoing_mail_is_left_alone(self):
+        comm = self._received()
+        comm.db_set("sent_or_received", "Sent", update_modified=False)
+        comm.reload()
+        self._attach_to(comm)
+        helpdesk_email.on_communication_update(comm)
+        self.assertFalse(
+            json.loads(frappe.db.get_value("Support Ticket", self.ticket.name, "attachments") or "[]")
+        )
+
+    def test_a_communication_with_no_ticket_is_ignored(self):
+        comm = self._received()
+        comm.db_set("reference_doctype", None, update_modified=False)
+        comm.db_set("reference_name", None, update_modified=False)
+        comm.reload()
+        self._attach_to(comm)
+        helpdesk_email.on_communication_update(comm)  # must not raise
+        still_there = frappe.get_all(
+            "File", filters={"attached_to_doctype": "Communication", "attached_to_name": comm.name}
+        )
+        self.assertEqual(len(still_there), 1, "left where frappe put it")
 
 
 class TestBodyCleaning(IntegrationTestCase):
@@ -508,5 +635,21 @@ def _website_user(email: str) -> str:
         frappe.get_doc({
             "doctype": "User", "email": email, "first_name": "poc",
             "user_type": "Website User", "send_welcome_email": 0,
+        }).insert(ignore_permissions=True)
+    return email
+
+
+def _poc_for(client: str, division: str, email: str) -> str:
+    if not frappe.db.exists("User", email):
+        u = frappe.get_doc({
+            "doctype": "User", "email": email, "first_name": "poc",
+            "user_type": "Website User", "send_welcome_email": 0,
+        })
+        u.append("roles", {"role": "Support Client"})
+        u.insert(ignore_permissions=True)
+    if not frappe.db.exists("POC", email):
+        frappe.get_doc({
+            "doctype": "POC", "poc_name": "Attach POC", "email": email, "is_primary": 1,
+            "client": client, "division": division, "user": email,
         }).insert(ignore_permissions=True)
     return email

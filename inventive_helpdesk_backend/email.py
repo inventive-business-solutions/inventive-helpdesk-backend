@@ -482,6 +482,83 @@ def on_communication(doc, method=None):
         doc.db_set("reference_name", name, update_modified=False)
 
 
+# A single mail should not be able to bury a ticket. Anything beyond this is left on the
+# Communication, where an agent can still reach it from the desk.
+_MAX_INBOUND_ATTACHMENTS = 20
+
+
+def on_communication_update(doc, method=None):
+    """Move an inbound email's attachments onto the ticket it belongs to.
+
+    Frappe attaches inbound files to the COMMUNICATION, not to the referenced document
+    (receive.py:632-645), so "here's a screenshot of the error" — routine for after-sales
+    support — left the agent reading a body that referred to a file the ticket did not
+    have. The file existed, but only in the desk, on a Communication no agent opens.
+
+    This is `on_update` rather than part of `on_communication` because of the ORDER frappe
+    works in: insert (our after_insert hook runs, sees nothing), reload, save attachments,
+    then save — and that final save is what gets us here. Putting this in after_insert
+    would look right and always find zero files.
+
+    Re-parenting rather than copying also fixes the permission: File.has_permission defers
+    to whatever the file is attached to, so on a Communication a client POC could not
+    download their OWN attachment, while on the ticket it follows the tenant isolation
+    already enforced there.
+
+    Naturally idempotent — once re-parented, the query below no longer matches, so
+    repeated on_update calls do nothing."""
+    if doc.sent_or_received != "Received":
+        return
+    if doc.reference_doctype != "Support Ticket" or not doc.reference_name:
+        return
+    files = frappe.get_all(
+        "File",
+        filters={"attached_to_doctype": "Communication", "attached_to_name": doc.name},
+        fields=["name", "file_name", "file_url"],
+        order_by="creation asc",
+        # `limit`, not `limit_page_length` — the latter is deprecated for removal in v17
+        # (frappe/model/qb_query.py:153).
+        limit=_MAX_INBOUND_ATTACHMENTS,
+    )
+    if not files:
+        return
+    try:
+        refs = []
+        for f in files:
+            frappe.db.set_value(
+                "File",
+                f.name,
+                {"attached_to_doctype": "Support Ticket", "attached_to_name": doc.reference_name},
+                update_modified=False,
+            )
+            refs.append({"name": f.file_name, "url": f.file_url})
+        _append_ticket_attachments(doc.reference_name, refs)
+    except Exception:
+        # An attachment that fails to move must not cost us the message it came with.
+        frappe.log_error(title="Inbound attachment re-parenting failed")
+
+
+def _append_ticket_attachments(ticket_name, refs):
+    """Add file refs to the ticket's own `attachments` list, matching the shape
+    api._attach_private_file writes so the portal renders both identically."""
+    current_raw = frappe.db.get_value("Support Ticket", ticket_name, "attachments")
+    try:
+        current = json.loads(current_raw or "[]")
+    except (ValueError, TypeError):
+        current = []
+    seen = {(r or {}).get("url") for r in current}
+    added = [r for r in refs if r["url"] not in seen]
+    if not added:
+        return
+    frappe.db.set_value(
+        "Support Ticket",
+        ticket_name,
+        "attachments",
+        json.dumps(current + added),
+        update_modified=False,
+    )
+
+
 @frappe.whitelist(allow_guest=True, methods=["POST"])
 def receive_webhook():
     """Local dev intake: Mailpit POSTs here for every captured message. Turn inbound support

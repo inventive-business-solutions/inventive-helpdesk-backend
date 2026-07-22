@@ -43,6 +43,11 @@ has_permission = {
 doc_events = {
     "Communication": {
         "after_insert": "inventive_helpdesk_backend.email.on_communication",
+        # Attachments need a SECOND hook, not a bigger after_insert. Frappe saves inbound
+        # files only after the Communication is inserted (frappe/email/receive.py:741-748),
+        # so at after_insert time there is nothing to find yet — the save that follows is
+        # what fires this.
+        "on_update": "inventive_helpdesk_backend.email.on_communication_update",
     },
     "Support Ticket": {
         "after_insert": [
