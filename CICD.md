@@ -105,6 +105,14 @@ API-based deploy step be added later.
 | Secret | Notes |
 | --- | --- |
 | `APPS_JSON_BASE64` | Base64 apps.json containing a classic PAT — **a secret, not a variable**, so it stays masked in run logs |
+| `PORTAINER_WEBHOOK_URL` | Stack webhook. Unset ⇒ the Deploy step is skipped and you release manually in Portainer |
+| `PORTAINER_CLEARCACHE_WEBHOOK_URL` | Service webhook for the `clear-cache` service. Unset ⇒ falls back to the timed clear in `docker-compose.yml`. Never fails the run |
+
+To create the clear-cache webhook: Portainer → **Services** → `<stack>_clear-cache` → **Service
+webhook** → copy the URL, then `gh secret set PORTAINER_CLEARCACHE_WEBHOOK_URL --repo $REPO
+--env Production --body "<url>"`. It force-updates that one service, which re-runs
+`bench --site all clear-cache` once. See the note on `migration` in `deploy/docker-compose.yml`
+for why this has to happen *after* the rollout rather than during it.
 
 Generate `APPS_JSON_BASE64` with a **classic** PAT scoped to `repo` only
 (fine-grained PATs are per-repo and `GITHUB_TOKEN` does not work inside BuildKit for
@@ -236,8 +244,9 @@ elsewhere. Deliberate differences from that reference:
    logs and are readable by anyone with repo read access; this one embeds a PAT. The
    workflow also passes it via `env:` rather than inlining it, so the value never appears
    in the rendered command.
-2. **No CD step.** `samanvay-sangam-backend` posts to a `PORTAINER_WEBHOOK_URL` and
-   then verifies the deployed `build_sha`. No webhook URL is configured for this stack
-   yet, so releasing is a manual *Update the stack* in Portainer. If a webhook becomes
-   available, add the Deploy and Verify steps back — the `build_sha.txt` stamp needed
-   for verification is already built into the image.
+2. **A third post-deploy step.** Like `samanvay-sangam-backend`, this workflow posts to
+   `PORTAINER_WEBHOOK_URL` and then verifies the deployed `build_sha`. It additionally
+   fires a `clear-cache` webhook once verification passes, because `bench migrate` clears
+   the asset cache at the *start* of the rollout, while old tasks are still serving and
+   can re-poison it. Both webhooks are optional: without them you release manually in
+   Portainer, and the timed clear in `deploy/docker-compose.yml` still covers the cache.
