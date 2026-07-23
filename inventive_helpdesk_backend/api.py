@@ -18,8 +18,10 @@ import json
 import frappe
 from frappe import _
 from frappe.model.rename_doc import rename_doc
+from frappe.rate_limiter import rate_limit
 from frappe.sessions import get_csrf_token
 from frappe.utils import cint, now_datetime
+from frappe.utils.password import get_password_reset_limit
 
 from inventive_helpdesk_backend.access import assert_user_unclaimed
 from inventive_helpdesk_backend.permissions import MANAGER_ROLES, TEAM_ROLES
@@ -572,17 +574,19 @@ def _ensure_login_user(email, full_name, user_type, role, owner_doctype=None, ow
     return user
 
 
-def _invite_email_html(user, link):
-    """Branded set-password email body. Indigo accent matches the app's design system."""
+def _action_email_html(user, link, heading, intro, cta):
+    """Branded one-button email body. Indigo accent matches the app's design system.
+    Shared by the invite and the password reset so both land on our own /set-password
+    page and read as the same product."""
     name = frappe.utils.escape_html(user.first_name or user.email)
     return f"""
 <div style="font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;max-width:520px;margin:0 auto;color:#1e2230;">
-  <h2 style="font-size:20px;font-weight:700;margin:0 0 6px;">Welcome to Inventive Helpdesk</h2>
+  <h2 style="font-size:20px;font-weight:700;margin:0 0 6px;">{heading}</h2>
   <p style="font-size:14px;line-height:1.6;color:#464b5c;margin:0 0 18px;">
-    Hi {name}, an account has been created for you. Set a password to activate it and sign in.
+    Hi {name}, {intro}
   </p>
   <p style="margin:0 0 22px;">
-    <a href="{link}" style="display:inline-block;background:#4f46e5;color:#fff;text-decoration:none;font-weight:600;font-size:14px;padding:11px 20px;border-radius:9px;">Set your password</a>
+    <a href="{link}" style="display:inline-block;background:#4f46e5;color:#fff;text-decoration:none;font-weight:600;font-size:14px;padding:11px 20px;border-radius:9px;">{cta}</a>
   </p>
   <p style="font-size:12.5px;line-height:1.6;color:#6b7182;margin:0 0 6px;">Or paste this link into your browser:</p>
   <p style="font-size:12.5px;word-break:break-all;margin:0 0 22px;"><a href="{link}" style="color:#4f46e5;">{link}</a></p>
@@ -590,6 +594,24 @@ def _invite_email_html(user, link):
     If you weren't expecting this, you can safely ignore this email.
   </p>
 </div>""".strip()
+
+
+def _invite_email_html(user, link):
+    return _action_email_html(
+        user, link,
+        heading=_("Welcome to Inventive Helpdesk"),
+        intro=_("an account has been created for you. Set a password to activate it and sign in."),
+        cta=_("Set your password"),
+    )
+
+
+def _reset_email_html(user, link):
+    return _action_email_html(
+        user, link,
+        heading=_("Reset your password"),
+        intro=_("we received a request to reset your Inventive Helpdesk password. Choose a new one below — the link works once and expires."),
+        cta=_("Choose a new password"),
+    )
 
 
 def _send_invite_mail(user, context):
@@ -617,6 +639,55 @@ def _send_invite_mail(user, context):
     except (frappe.OutgoingEmailError, frappe.ValidationError):
         frappe.log_error(title=f"{context} invite email failed")
         return False
+
+
+@frappe.whitelist(allow_guest=True, methods=["POST"])
+@rate_limit(limit=get_password_reset_limit, seconds=60 * 60)
+def request_password_reset(user):
+    """Email a password-reset link that lands on OUR app, not the Frappe desk.
+
+    frappe.core.doctype.user.user.reset_password builds its link with get_url(), which
+    resolves to the backend host — so "Forgot password" mailed people a link to
+    helpdeskfrappe…/update-password, Frappe's own desk page. Wrong product, wrong
+    branding, and a portal client has no business on the desk at all. The invite flow
+    already retargets the key at app_url + /set-password; this does the same for resets.
+
+    Enumeration-safe, mirroring the upstream contract (CWE-204): the response is identical
+    whether the address exists, is disabled, or is the Administrator, and every failure is
+    swallowed into that same answer rather than surfacing as a distinguishable error.
+    Rate-limited on the same budget as upstream, since this endpoint sends mail to an
+    address chosen by an unauthenticated caller."""
+    try:
+        user_doc = frappe.get_doc("User", user)
+        if user_doc.name != "Administrator" and user_doc.enabled:
+            user_doc.validate_reset_password()
+            app_url = (frappe.conf.get("app_url") or "").rstrip("/")
+            if app_url:
+                # Mints a fresh one-time key (stored hashed) and returns a URL holding the
+                # raw key; we keep the key and drop Frappe's URL.
+                key = user_doc._reset_password().split("key=", 1)[1]
+                frappe.sendmail(
+                    recipients=[user_doc.email],
+                    subject=_("Reset your Inventive Helpdesk password"),
+                    message=_reset_email_html(user_doc, f"{app_url}/set-password?key={key}"),
+                    now=True,
+                )
+            else:
+                # No app_url configured: better a desk link than no email at all.
+                user_doc._reset_password(send_email=True)
+    except frappe.DoesNotExistError:
+        frappe.clear_messages()
+    except frappe.OutgoingEmailError:
+        frappe.clear_messages()
+        frappe.log_error(title="Password reset email could not be sent", message=frappe.get_traceback())
+    except Exception:
+        frappe.clear_messages()
+        frappe.log_error(title="Password reset failed unexpectedly", message=frappe.get_traceback())
+
+    frappe.msgprint(
+        msg=_("If this email is registered with us, we have sent password reset instructions to it. Please check your inbox."),
+        title=_("Password Reset"),
+    )
 
 
 @frappe.whitelist(methods=["POST"])
