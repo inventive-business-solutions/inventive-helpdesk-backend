@@ -5,8 +5,10 @@ Support Ticket visibility has three tiers (see ticket_query / ticket_has_permiss
   - Agents (Support Team, non-manager): scoped to their own work — assigned to them,
     raised by them, the shared triage inbox (unrouted tickets), their teams' queues,
     and tickets they collaborate on. Identity is the Team Member linked to their User.
-  - Client POCs (matched via POC.user == session user): confined to their own Client,
-    its Divisions, and its Support Tickets.
+  - Client contacts (matched via POC.user == session user): confined to their own Client,
+    its Divisions, and the Support Tickets of the divisions they hold. A contact holds a
+    SET of divisions (POC.divisions) — one for a division POC, several for a client Lead —
+    and an empty set means no ticket access at all, which is how a Lead starts life.
 Enforced server-side via permission_query_conditions (list/report) + has_permission
 (direct get/save). Work notes are additionally hidden by permlevel 1 on the Support
 Ticket `notes` table. (Client / Division stay staff-see-all — only tickets are scoped
@@ -59,9 +61,26 @@ def manager_write_gate(doc, ptype=None, user=None):
 
 @request_cache
 def _poc(user: str):
-    """POC scope (client + division) for a portal user. Request-cached: list views
-    run a permission check per row, and a user's POC link can't change mid-request."""
-    return frappe.db.get_value("POC", {"user": user}, ["client", "division"], as_dict=True)
+    """POC scope for a portal user: their client, and the set of divisions they hold.
+
+    A contact may hold several divisions — a division POC usually holds one, a client Lead
+    holds the ones they oversee — so scope is a SET, and every portal user is filtered
+    through the same rule. An EMPTY set is the normal state of a freshly created Lead and
+    means no ticket access at all; callers must treat it as deny, never as "unscoped".
+
+    get_all, not get_list: permission_query_conditions must not apply to the query that
+    computes the caller's own scope, or it would recurse. Request-cached because list views
+    run a permission check per row and a user's POC link can't change mid-request.
+    """
+    row = frappe.db.get_value("POC", {"user": user}, ["name", "client"], as_dict=True)
+    if not row:
+        return None
+    divisions = frappe.get_all(
+        "POC Division", filters={"parent": row.name, "parenttype": "POC"}, pluck="division"
+    )
+    return frappe._dict(
+        {"name": row.name, "client": row.client, "divisions": frozenset(d for d in divisions if d)}
+    )
 
 
 @request_cache
@@ -115,9 +134,12 @@ def ticket_query(user: str | None = None) -> str:
                   ))
         )"""
     p = _poc(user)
-    if not (p and p.division):
+    if not (p and p.divisions):
+        # No POC record, or a contact with no divisions assigned yet (a Lead before anyone
+        # scopes them). Deny outright — an empty scope must never widen to the whole table.
         return "1=0"
-    return f"`tabSupport Ticket`.division = {frappe.db.escape(p.division)}"
+    divs = ", ".join(frappe.db.escape(d) for d in sorted(p.divisions))
+    return f"`tabSupport Ticket`.division IN ({divs})"
 
 
 def ticket_has_permission(doc, ptype: str | None = None, user: str | None = None) -> bool:
@@ -146,7 +168,7 @@ def ticket_has_permission(doc, ptype: str | None = None, user: str | None = None
                 return True
         return False
     p = _poc(user)
-    return bool(p and p.division) and doc.get("division") == p.division
+    return bool(p and p.divisions) and doc.get("division") in p.divisions
 
 
 # ---- Client ---------------------------------------------------------------
