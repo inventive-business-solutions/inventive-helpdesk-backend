@@ -49,6 +49,24 @@ def _author() -> str:
     return frappe.db.get_value("User", frappe.session.user, "full_name") or frappe.session.user
 
 
+def _as_list(value) -> list:
+    """Coerce a whitelisted endpoint's list argument to a real list.
+
+    A JSON request body arrives already decoded, but the same call made as form data (or
+    via `frappe.call`) delivers the array as a JSON *string* — so a bare `for x in value`
+    would silently iterate the characters of "[\"a\"]" and write garbage rows. Anything
+    unparseable is treated as empty rather than raising: these feed permission scopes, and
+    an empty scope denies, which is the safe direction to fail."""
+    if not value:
+        return []
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (ValueError, TypeError):
+            return []
+    return list(value) if isinstance(value, (list, tuple, set)) else []
+
+
 def _norm_attachments(attachments) -> str:
     if attachments is None:
         return "[]"
@@ -96,13 +114,27 @@ def me():
             if member else []
         )
         ctx["is_agent"] = not ctx["manage"]
-    poc = frappe.db.get_value("POC", {"user": user}, ["client", "division"], as_dict=True)
+    poc = frappe.db.get_value("POC", {"user": user}, ["name", "client", "is_lead"], as_dict=True)
     if poc:
-        d = frappe.db.get_value("Division", poc.division, ["division_name", "division_code"], as_dict=True) or {}
+        divisions = frappe.get_all(
+            "POC Division",
+            filters={"parent": poc.name, "parenttype": "POC"},
+            pluck="division",
+            order_by="idx",
+        )
+        # `divisions` is the real scope — a contact may hold several, and a Lead may hold
+        # none at all (no ticket access yet). The singular keys below are the FIRST entry,
+        # kept only so views that still read `session.division` keep working; they are not
+        # the authority and must not be used for filtering.
+        first = divisions[0] if divisions else None
+        d = (frappe.db.get_value("Division", first, ["division_name", "division_code"], as_dict=True)
+             if first else None) or {}
         ctx.update({
             "client": poc.client,
-            "division": poc.division,
-            "division_name": d.get("division_name") or poc.division,
+            "is_lead": bool(poc.is_lead),
+            "divisions": divisions,
+            "division": first,
+            "division_name": d.get("division_name") or first,
             "division_code": d.get("division_code") or "",
         })
     return ctx
@@ -457,7 +489,7 @@ def update_product(name, product_name=None):
 
 
 @frappe.whitelist(methods=["POST"])
-def update_poc(name, poc_name=None, email=None, is_primary=None):
+def update_poc(name, poc_name=None, email=None, phone=None, divisions=None, is_primary=None):
     """Edit a POC. POC is autonamed by `email`, so a changed email must rename the
     doc — and if the POC already has a portal login, the User is renamed too so the
     sign-in address stays in sync (that link is how me()/permissions scope them).
@@ -477,8 +509,16 @@ def update_poc(name, poc_name=None, email=None, is_primary=None):
         frappe.throw(_("Another user already signs in as {0} — the POC email must be unique").format(new_email))
     if poc_name is not None:
         doc.poc_name = poc_name
+    if phone is not None:
+        doc.phone = phone or None
     if is_primary is not None:
         doc.is_primary = cint(is_primary)
+    if divisions is not None:
+        # Replace wholesale rather than merge: the caller sends the complete set, so a
+        # division removed in the UI must actually lose access. Clearing the legacy single
+        # column too, or POC.validate would silently re-append the old division.
+        doc.division = None
+        doc.set("divisions", [{"division": d} for d in _as_list(divisions) if d])
     if new_email:
         doc.email = new_email
     doc.save(ignore_permissions=True)
@@ -496,6 +536,87 @@ def update_poc(name, poc_name=None, email=None, is_primary=None):
             # requires write on User, which a Support Manager without System Manager
             # doesn't have.
             rename_doc("User", linked_user, new_email, force=True, ignore_permissions=True)
+    return name
+
+
+@frappe.whitelist(methods=["POST"])
+def create_contact(client, poc_name, email, phone=None, divisions=None, is_lead=0):
+    """Create a client contact — a division POC or a client Lead, same record either way.
+
+    `divisions` may be empty, and for a Lead usually is at creation: they are added during
+    client onboarding, before any division exists. An empty set means no ticket access
+    until someone assigns them, which is deliberate (see permissions._poc)."""
+    _require_manager()
+    doc = frappe.get_doc({
+        "doctype": "POC",
+        "client": client,
+        "poc_name": poc_name,
+        "email": (email or "").strip(),
+        "phone": phone or None,
+        "is_lead": cint(is_lead),
+        "divisions": [{"division": d} for d in _as_list(divisions) if d],
+    })
+    doc.insert(ignore_permissions=True)
+    return doc.name
+
+
+@frappe.whitelist(methods=["POST"])
+def set_contact_divisions(name, divisions):
+    """Replace the divisions a contact can see. This IS the access-granting call — the set
+    given here becomes their entire ticket scope, so anything omitted loses access."""
+    _require_manager()
+    doc = frappe.get_doc("POC", name)
+    doc.division = None  # legacy column; POC.validate would otherwise re-append it
+    doc.set("divisions", [{"division": d} for d in _as_list(divisions) if d])
+    doc.save(ignore_permissions=True)
+    return doc.name
+
+
+# ---- client products (the "product" a client runs, per division or client-wide) ----
+def _client_product_payload(client, product, dev_start, expected_completion, divisions):
+    return {
+        "client": client,
+        "product": product,
+        "dev_start": dev_start or None,
+        "expected_completion": expected_completion or None,
+        # Empty means "attached to the client as a whole" — the only shape available to a
+        # client with no divisions, and a legitimate choice even when it has some.
+        "divisions": [{"division": d} for d in _as_list(divisions) if d],
+    }
+
+
+@frappe.whitelist(methods=["POST"])
+def create_client_product(client, product, dev_start=None, expected_completion=None, divisions=None):
+    """Attach a product to a client, optionally scoped to specific divisions."""
+    _require_manager()
+    doc = frappe.get_doc({
+        "doctype": "Client Product",
+        **_client_product_payload(client, product, dev_start, expected_completion, divisions),
+    })
+    doc.insert(ignore_permissions=True)
+    return doc.name
+
+
+@frappe.whitelist(methods=["POST"])
+def update_client_product(name, product=None, dev_start=None, expected_completion=None, divisions=None):
+    _require_manager()
+    doc = frappe.get_doc("Client Product", name)
+    if product is not None:
+        doc.product = product
+    if dev_start is not None:
+        doc.dev_start = dev_start or None
+    if expected_completion is not None:
+        doc.expected_completion = expected_completion or None
+    if divisions is not None:
+        doc.set("divisions", [{"division": d} for d in _as_list(divisions) if d])
+    doc.save(ignore_permissions=True)
+    return doc.name
+
+
+@frappe.whitelist(methods=["POST"])
+def delete_client_product(name):
+    _require_manager()
+    frappe.delete_doc("Client Product", name, ignore_permissions=True)
     return name
 
 

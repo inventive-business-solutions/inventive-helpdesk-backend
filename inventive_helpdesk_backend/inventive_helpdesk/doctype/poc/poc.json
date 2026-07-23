@@ -9,9 +9,11 @@
  "field_order": [
   "poc_name",
   "email",
-  "is_primary",
+  "phone",
+  "is_lead",
   "client",
   "division",
+  "divisions",
   "user",
   "invited_on"
  ],
@@ -33,10 +35,17 @@
    "unique": 1
   },
   {
+   "fieldname": "phone",
+   "fieldtype": "Data",
+   "label": "Phone",
+   "options": "Phone"
+  },
+  {
    "default": "0",
-   "fieldname": "is_primary",
+   "fieldname": "is_lead",
    "fieldtype": "Check",
-   "label": "Primary"
+   "label": "Client Lead",
+   "description": "Created at client level and oversees divisions, rather than belonging to one."
   },
   {
    "fieldname": "client",
@@ -52,7 +61,15 @@
    "in_list_view": 1,
    "label": "Division",
    "options": "Division",
-   "reqd": 1
+   "reqd": 0,
+   "description": "Superseded by the Divisions table; retained for one release so the migration can be rolled back."
+  },
+  {
+   "fieldname": "divisions",
+   "fieldtype": "Table",
+   "label": "Divisions",
+   "options": "POC Division",
+   "description": "Divisions this contact can see. Empty means no ticket access yet."
   },
   {
    "fieldname": "user",
@@ -66,6 +83,13 @@
    "fieldtype": "Datetime",
    "label": "Invited On",
    "read_only": 1
+  },
+  {
+   "default": "0",
+   "fieldname": "is_primary",
+   "fieldtype": "Check",
+   "label": "Primary (retired)",
+   "description": "Retired in favour of Leads. Not read anywhere; dropped in a later release."
   }
  ],
  "grid_page_length": 50,

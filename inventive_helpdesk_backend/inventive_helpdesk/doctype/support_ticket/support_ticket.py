@@ -98,10 +98,21 @@ class SupportTicket(Document):
             self.ticket_type = "Query"
             if not self.priority:
                 self.priority = "Medium"
-            poc = frappe.db.get_value("POC", {"email": addr}, ["poc_name", "client", "division"], as_dict=True)
+            poc = frappe.db.get_value("POC", {"email": addr}, ["name", "poc_name", "client"], as_dict=True)
             if poc:
                 self.client = poc.client
-                self.division = poc.division
+                # A contact may hold several divisions (a Lead overseeing a few), and an
+                # inbound email doesn't say which one it's about. Take the first only when
+                # it's unambiguous; otherwise leave `division` blank so the ticket lands in
+                # the shared triage inbox for an agent to route, rather than guessing wrong
+                # and hiding it from the division that should see it.
+                divisions = frappe.get_all(
+                    "POC Division",
+                    filters={"parent": poc.name, "parenttype": "POC"},
+                    pluck="division",
+                    order_by="idx",
+                )
+                self.division = divisions[0] if len(divisions) == 1 else None
                 if not self.raised_by:
                     self.raised_by = poc.poc_name
             elif not self.raised_by:

@@ -9,6 +9,7 @@
  "field_order": [
   "client_name",
   "client_code",
+  "status",
   "since",
   "product"
  ],
@@ -30,16 +31,25 @@
    "unique": 1
   },
   {
+   "default": "Onboarding",
+   "fieldname": "status",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Status",
+   "options": "Onboarding\nActive\nOn Hold\nChurned"
+  },
+  {
    "fieldname": "since",
    "fieldtype": "Date",
-   "label": "Since"
+   "label": "Onboarding Date"
   },
   {
    "fieldname": "product",
    "fieldtype": "Link",
    "in_list_view": 1,
    "label": "Product",
-   "options": "Product"
+   "options": "Product",
+   "description": "Superseded by Client Product; retained for one release so the migration can be rolled back."
   }
  ],
  "grid_page_length": 50,
