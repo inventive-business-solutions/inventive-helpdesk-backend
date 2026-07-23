@@ -335,6 +335,35 @@ jobs:
           echo "status=unhealthy" >> "$GITHUB_OUTPUT"
           exit 1
 
+      # `bench migrate` clears the asset cache, but does it in Migrate.setUp() — before the
+      # rollout finishes. Old backend tasks still serving traffic then regenerate the shared
+      # `assets_json` key in redis from the OLD image, and the new tasks inherit it, so every
+      # page points at asset hashes that no longer exist on disk. See the note on the
+      # `migration` service in deploy/docker-compose.yml.
+      #
+      # This runs only after Verify Deployment confirmed the new build_sha is live, so by
+      # here there is no old task left to re-poison the key. The compose file also clears on
+      # a timer for redeploys that never go through this workflow; this is the exact one.
+      #
+      # Deliberately non-fatal: the image is already deployed and verified healthy, so a
+      # missing webhook or a flaky Portainer must not turn a good release red. The compose
+      # timer is the backstop, and a stale cache is a one-command fix, not an outage.
+      - name: Clear stale asset cache
+        if: steps.verify.outputs.status == 'healthy'
+        env:
+          WEBHOOK_URL: ${{ secrets.PORTAINER_CLEARCACHE_WEBHOOK_URL }}
+        run: |
+          if [ -z "$WEBHOOK_URL" ]; then
+            echo "::notice::PORTAINER_CLEARCACHE_WEBHOOK_URL not set — relying on the timed clear-cache in docker-compose.yml."
+            exit 0
+          fi
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$WEBHOOK_URL" || echo 000)
+          if [ "$HTTP_CODE" -ne 204 ] && [ "$HTTP_CODE" -ne 200 ]; then
+            echo "::warning::clear-cache webhook returned HTTP $HTTP_CODE — if the desk renders unstyled, run: bench --site ${{ vars.SITE_NAME }} clear-cache"
+            exit 0
+          fi
+          echo "Asset cache cleared (HTTP $HTTP_CODE)"
+
       # The build is loaded into this runner's local daemon rather than pushed straight
       # out, and the runner is long-lived — without this every run strands a full image
       # and the disk fills. Safe to drop: the deploy pulls from the registry, and

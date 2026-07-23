@@ -12,8 +12,8 @@
 # only scaling to 0 and back forced a new task.
 #
 # `any` is Docker's own default for long-running services and is what these should always
-# have been. The one-shot jobs below (migration, configurator, create-site, backup-sites)
-# deliberately keep `condition: none` — they are meant to run once and stop.
+# have been. The one-shot jobs below (migration, clear-cache, configurator, create-site,
+# backup-sites) deliberately keep `condition: none` — they are meant to run once and stop.
 x-custom-image: &custom_image
   image: ${IMAGE_NAME:?No image set}:${VERSION:?No version set}
 
@@ -200,6 +200,64 @@ services:
         bench --site all set-config -g chromium_path /usr/bin/chromium-headless-shell
         bench --site all set-config -p maintenance_mode 0
         bench --site all set-config -p pause_scheduler 0
+        # `bench migrate` DOES clear the asset cache — but in Migrate.setUp(), i.e. before
+        # any of the above runs. At that point the OLD backend tasks are still serving, and
+        # any request they handle regenerates the shared `assets_json` key in redis-cache
+        # from the OLD image's sites/assets/assets.json. The new tasks then boot and read
+        # that stale value, so every page renders <link>/<script> tags pointing at asset
+        # hashes that no longer exist on disk — 404s, and an unstyled desk.
+        #
+        # redis-cache has no volume, but it is a long-running service that is NOT recreated
+        # during a rolling update, so the poisoned key survives the whole deploy.
+        #
+        # Hit production on 2026-07-23: login.bundle.DZBBLCJA.css (stale, 404) was served
+        # while login.bundle.WVDSPPAN.css (real) sat on disk. It only shows up when a
+        # request lands mid-migration, and it only breaks the bundles whose content
+        # actually changed — a bundle that hashed the same looks fine, which makes it
+        # read as "only CSS is broken".
+        #
+        # So clear it again at the END, once the rollout has had time to finish. The sleep
+        # is a timer, not a real barrier — CI also fires a `clear-cache` webhook after its
+        # Verify Deployment step, which is the exact-ordering half of this fix. Either one
+        # alone closes the common case; both together cover manual Portainer redeploys too.
+        sleep 180
+        bench --site all clear-cache
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+    networks:
+      - mariadb-network
+      - bench-network
+
+  # Clears the shared `assets_json` redis key after a rollout has completed. See the long
+  # note in `migration` for why that is needed; this service is the exact-ordering half of
+  # the fix, triggered by CI once Verify Deployment confirms the new build_sha is live.
+  #
+  # replicas is 1, not 0: a Portainer service webhook performs `docker service update
+  # --force`, which only spawns a fresh task if the service is meant to have one. At 0 the
+  # webhook would be accepted and silently do nothing. With `condition: none` the task runs
+  # once and stops, so a completed run costs nothing until the next force-update.
+  #
+  # Harmless if it also runs at deploy time (the image digest changes each release, so
+  # Swarm starts a task then too) — it is idempotent, takes about a second, and clearing a
+  # cache mid-rollout is exactly what migrate already does.
+  clear-cache:
+    <<: *custom_image
+    deploy:
+      mode: replicated
+      replicas: ${CLEAR_CACHE:-1}
+      restart_policy:
+        condition: none
+    entrypoint: ["bash", "-c"]
+    command:
+      - >
+        wait-for-it -t 120 $$DB_HOST:$$DB_PORT;
+        wait-for-it -t 120 redis-cache:6379;
+        bench --site all clear-cache
+    environment:
+      # Without these the `wait-for-it $$DB_HOST:$$DB_PORT` above gets a bare ":" and
+      # aborts with a usage error — same trap as create-site.
+      DB_HOST: ${DB_HOST:-mariadb_db}
+      DB_PORT: ${DB_PORT:-3306}
     volumes:
       - sites:/home/frappe/frappe-bench/sites
     networks:
@@ -357,6 +415,7 @@ networks:
 # ------------------------+--------------------------------------+---------
 # ADMIN_PASSWORD          | Admin password for new site           | nil
 # BENCH_NAME              | Name of the bench network             | inventive_helpdesk_bench
+# CLEAR_CACHE             | Run the post-rollout cache clear      | 1
 # CLIENT_MAX_BODY_SIZE    | Nginx max upload size                 | 1024m
 # CONFIGURE               | Re-generate common_site_config.json   | 0
 # CREATE_SITE             | Enable site creation on deploy        | 0
