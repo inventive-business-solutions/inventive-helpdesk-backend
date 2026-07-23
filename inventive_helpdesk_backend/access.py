@@ -1,13 +1,19 @@
-"""Login-revocation invariant for Inventive Helpdesk.
+"""Identity invariants for Inventive Helpdesk.
 
 A staff member (Team Member) or client contact (POC) is invited by provisioning a
-Frappe User (see api.invite_member / api.invite_poc). When their backing record is
-deleted they must lose that login — otherwise a removed person can still sign in.
-This module centralises that revocation so every deletion path (the whitelisted API,
-the raw REST resource endpoint, and the desk UI) enforces it via the doctypes'
-on_trash hooks, and a one-time patch closes the historical gap.
+Frappe User (see api.invite_member / api.invite_poc). Two rules hold this together:
+
+1. **One email, one person.** A Frappe User is keyed by email, so two directory records
+   sharing an address resolve to the SAME login — and inviting the second one mints a
+   password-reset key against the first one's account. See assert_email_unclaimed.
+2. **A deleted record loses its login.** Otherwise a removed person can still sign in.
+   See revoke_login_if_orphaned.
+
+Both are enforced at the doctype hook level, so every path (the whitelisted API, the raw
+REST resource endpoint, and the desk UI) is covered rather than just the app's own forms.
 """
 import frappe
+from frappe import _
 
 # Imported explicitly: `frappe` does not import its own `sessions` submodule, so
 # `frappe.sessions` only resolves if something else happened to import it first. That
@@ -17,6 +23,68 @@ import frappe
 from frappe.sessions import clear_sessions
 
 from inventive_helpdesk_backend.permissions import MANAGER_ROLES
+
+
+# Directory doctypes that can own a login, with the noun to use when reporting a clash.
+_DIRECTORY = (("Team Member", "team member"), ("POC", "client contact"))
+
+
+def assert_email_unclaimed(doctype, name, email):
+    """Refuse an email address that another person's directory record already holds.
+
+    A Frappe User's docname IS its email, so two records sharing an address are two
+    people pointing at ONE login. api._ensure_login_user then re-uses that account and
+    api._send_invite_mail resets its password — handing the second person control of the
+    first person's login, including any elevated roles it carries.
+
+    `Team Member.email` carries no unique index (it is named by `member_name`), so nothing
+    below this stopped the collision; `POC` is already unique via `autoname: field:email`,
+    but is checked here too so the two directories cannot collide with each other.
+
+    Comparison is a plain `=`, which is case-insensitive under the site's `..._ci`
+    collation — matching how POC's own unique index already behaves.
+    """
+    email = (email or "").strip()
+    if not email:
+        return
+
+    for dt, noun in _DIRECTORY:
+        filters = {"email": email}
+        if dt == doctype:
+            filters["name"] = ("!=", name)
+        holder = frappe.db.get_value(dt, filters, "name")
+        if holder:
+            frappe.throw(
+                _("{0} is already used by the {1} “{2}”. Each person needs their own email address — sharing one would let either of them reset the other's password.").format(
+                    email, noun, holder
+                ),
+                title=_("Email already in use"),
+            )
+
+
+def assert_user_unclaimed(user, doctype, name):
+    """Refuse to hand an existing login to a record that is not already linked to it.
+
+    Defence in depth behind assert_email_unclaimed: that guard runs in `validate`, which
+    `ignore_validate`/`db_set` paths can skip, and it cannot see a User that no directory
+    record points at yet (a desk account created by hand, say). Provisioning re-uses an
+    account by design — a resend must not mint a second one — so the test is not "does
+    this User exist" but "does it already belong to somebody else".
+    """
+    if not user:
+        return
+    for dt, noun in _DIRECTORY:
+        filters = {"user": user}
+        if dt == doctype:
+            filters["name"] = ("!=", name)
+        holder = frappe.db.get_value(dt, filters, "name")
+        if holder:
+            frappe.throw(
+                _("The login {0} already belongs to the {1} “{2}”. Use a different email address.").format(
+                    user, noun, holder
+                ),
+                title=_("Login already in use"),
+            )
 
 
 def revoke_login_if_orphaned(user, exclude_doctype=None, exclude_name=None):
