@@ -21,6 +21,7 @@ from frappe.model.rename_doc import rename_doc
 from frappe.sessions import get_csrf_token
 from frappe.utils import cint, now_datetime
 
+from inventive_helpdesk_backend.access import assert_user_unclaimed
 from inventive_helpdesk_backend.permissions import MANAGER_ROLES, TEAM_ROLES
 
 
@@ -513,15 +514,29 @@ def delete_poc(name):
 # tickets — a tenant-isolation break. Provisioning refuses to cross an account over the line.
 _CLIENT_ROLE = "Support Client"
 _STAFF_ROLES = {"Support Team", "Support Manager", "System Manager", "Administrator"}
+# Roles a directory invite must never hand over: provisioning only ever grants Support
+# Team or Support Client, so an existing account holding one of these is out of scope for
+# the invite flow entirely — re-using it would be a privilege escalation, not an invite.
+_ELEVATED_ROLES = {"Support Manager", "System Manager", "Administrator"}
 
 
-def _ensure_login_user(email, full_name, user_type, role):
+def _ensure_login_user(email, full_name, user_type, role, owner_doctype=None, owner_name=None):
     """Create or fetch the Frappe User for `email`, guarantee it holds `role` and is
-    enabled, and return the saved doc. Re-using an existing account is deliberate — the
-    same person may already sign in (e.g. a POC for two divisions) — EXCEPT across the
-    client/staff line: we refuse to give a client POC a staff login or vice versa, so one
-    identity can never straddle both sides of tenant isolation. The caller links the User
-    to its record and sends the invite mail."""
+    enabled, and return the saved doc. Re-using an existing account is deliberate — a
+    resend must not mint a second login — EXCEPT where the account is not this record's
+    to re-use:
+
+    * across the client/staff line, so one identity can never straddle both sides of
+      tenant isolation;
+    * when another directory record already owns it (assert_user_unclaimed) — re-using it
+      there means _send_invite_mail resets a DIFFERENT person's password and hands their
+      account, and its roles, to the invitee;
+    * when the account outranks what we are provisioning. `_require_manager` lets a
+      Support Manager invite anyone, so without this a manager could type a System
+      Manager's address, receive the set-password link, and take that account over.
+      Directory invites only ever hand out Support Team / Support Client.
+
+    The caller links the User to its record and sends the invite mail."""
     if frappe.db.exists("User", email):
         user = frappe.get_doc("User", email)
         existing_roles = {r.role for r in user.roles}
@@ -530,6 +545,13 @@ def _ensure_login_user(email, full_name, user_type, role):
             frappe.throw(_("{0} already has a staff login, so it can't also be a client POC. Use a different email address.").format(email))
         if not provisioning_client and _CLIENT_ROLE in existing_roles:
             frappe.throw(_("{0} is already a client POC, so it can't also be given staff access. Use a different email address.").format(email))
+        assert_user_unclaimed(user.name, owner_doctype, owner_name)
+        if elevated := (existing_roles & _ELEVATED_ROLES):
+            frappe.throw(
+                _("{0} is an administrator account ({1}), so it can't be handed out as a directory invite. Use a different email address.").format(
+                    email, ", ".join(sorted(elevated))
+                )
+            )
     else:
         first, _sep, last = (full_name or email).partition(" ")
         user = frappe.get_doc({
@@ -609,7 +631,7 @@ def invite_poc(poc):
     if not email:
         frappe.throw(_("This POC has no email address to invite"))
 
-    user = _ensure_login_user(email, doc.poc_name, "Website User", "Support Client")
+    user = _ensure_login_user(email, doc.poc_name, "Website User", "Support Client", "POC", doc.name)
 
     # Link the account and (re)stamp the invite time. invited_on is the reference the
     # UI compares last_login against: a sign-in *after* this moment marks the POC Active.
@@ -643,7 +665,7 @@ def invite_member(member):
     if not email:
         frappe.throw(_("This member has no email address to invite"))
 
-    user = _ensure_login_user(email, doc.member_name, "System User", "Support Team")
+    user = _ensure_login_user(email, doc.member_name, "System User", "Support Team", "Team Member", doc.name)
 
     # Link the account and reset the member to Invited. There is no timestamp compare
     # here (unlike POCs): activation is event-driven via the on_login hook, which only
