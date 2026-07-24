@@ -35,6 +35,12 @@ has_permission = {
     ],
     "POC": "inventive_helpdesk_backend.permissions.manager_write_gate",
     "Product": "inventive_helpdesk_backend.permissions.manager_write_gate",
+    # Client Product shipped without this line, which made it the ONE master an agent
+    # could write: its DocPerms grant Support Team full CRUD, and the gate is what
+    # withholds create/write/delete from everyone below manager. The whitelisted
+    # endpoints call _require_manager, but those are not the enforcement point — an
+    # agent reaches the doctype directly through /api/resource/*.
+    "Client Product": "inventive_helpdesk_backend.permissions.manager_write_gate",
     "Team Member": "inventive_helpdesk_backend.permissions.manager_write_gate",
     "Assignment Group": "inventive_helpdesk_backend.permissions.manager_write_gate",
 }
