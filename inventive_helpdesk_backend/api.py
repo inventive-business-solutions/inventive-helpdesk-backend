@@ -456,7 +456,7 @@ def update_member(name, member_name=None, title=None, email=None):
 
 # ---- client / POC administration (staff only) -----------------------------
 @frappe.whitelist(methods=["POST"])
-def update_client(name, client_name=None, client_code=None, since=None, product=None):
+def update_client(name, client_name=None, client_code=None, since=None, status=None, product=None):
     """Edit a client, including a rename. `name` (autonamed from client_name) is a
     Link target on Support Ticket, Division and POC, so frappe.rename_doc cascades
     the new name to every reference. `product` is a Product docname ("" clears it)."""
@@ -466,6 +466,8 @@ def update_client(name, client_name=None, client_code=None, since=None, product=
         doc.client_code = client_code
     if since is not None:
         doc.since = since or None
+    if status:
+        doc.status = status
     if product is not None:
         doc.product = product or None
     doc.save(ignore_permissions=True)
