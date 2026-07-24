@@ -10,7 +10,7 @@ For deployment see [CICD.md](../CICD.md). For setup and features see [README.md]
 
 ## Data model
 
-11 DocTypes — 7 top-level, 4 child tables.
+18 DocTypes — 11 top-level, 7 child tables.
 
 ### Support Ticket
 
@@ -29,13 +29,27 @@ The centre of the app. Named by a controller (not `autoname` in JSON), see
 | `assignee` | Link → Team Member | |
 | `assignment_group` | Link → Assignment Group | the owning team |
 | `due_date`, `sla_risk` | Date, Check | |
-| `source` | Select | Portal, Email |
+| `last_activity_on` | Datetime | bumped by any message or note; drives the per-agent unread dot |
+| `source` | Select | Portal, Email, Manual, API |
 | `from_email` | Data | set for inbound-email tickets |
 | `description` | Text | |
-| `attachments` | — | |
+| `attachments` | Long Text | JSON list of `{name, url}` refs |
 | `conversation` | Table → Ticket Message | client-visible thread |
 | `collaborators` | Table → Ticket Collaborator | looped-in teams/members |
-| `notes` | Table → Work Note | internal, never sent to clients |
+| `notes` | Table → Work Note | internal, never sent to clients — **permlevel 1** |
+| `activity` | Table → Ticket Activity | status/priority/assignment handovers — **permlevel 1** |
+| `sender_kind` | Select | Registered, Known Contact, Unregistered, No Reply — see [DESIGN-email-reply-workflow.md](DESIGN-email-reply-workflow.md) |
+| `no_reply_reason` | Data | why the address was judged unreachable |
+| `first_response_notified_on` | Datetime | stamps the one-time first-reply email, so it only ever goes once |
+
+`notes` and `activity` sit at **permlevel 1**, and `Support Client` holds no permlevel-1
+row — so Frappe strips both from a client's read of the document. That is what keeps
+internal notes internal; it is not the UI declining to render them.
+
+`sender_kind` and `no_reply_reason` are a **cache**, not the authority. A POC being
+invited changes the answer without touching the ticket, so anything that must be correct
+calls `sender.classify()` rather than reading the column (`sender.refresh_for_poc` is what
+re-syncs them on invite).
 
 **`assignee` and `assignment_group` move together.** A member only exists within a team,
 and the backend rejects a member with no team — so writes go through `setAssignment`
@@ -45,12 +59,31 @@ and the backend rejects a member with no team — so writes go through `setAssig
 
 | DocType | Named by | Fields |
 | --- | --- | --- |
-| **Client** | `client_name` | client_code, since, product |
+| **Client** | `client_name` | client_code, status (Onboarding/Active/On Hold/Churned), since, product *(legacy — see below)* |
 | **Division** | `{client}-{division_code}` | division_name, division_code, client |
-| **POC** | `email` | poc_name, is_primary, client, division, user, invited_on |
+| **POC** | `email` | poc_name, phone, is_lead, client, **divisions** (child table), user, invited_on, division + is_primary *(legacy — see below)* |
 | **Product** | `product_name` | — |
-| **Team Member** | `member_name` | email, title, status, user |
+| **Client Product** | hash | client, product, dev_start, expected_completion, divisions (child table) |
+| **Team Member** | `member_name` | email, title, status (Not Invited/Invited/Active), user |
 | **Assignment Group** | `group_name` | members (child table) |
+
+**A POC's scope is `divisions`, the child table — not `division`.** A contact holds a
+SET: one for a division POC, several for a client Lead. `permissions._poc` reads only the
+table, and an empty set means **no ticket access at all**, which is the normal state of a
+Lead created during onboarding before any division exists. The singular `division` column
+is legacy, still written so the migration can be rolled back, and reconciled with the
+table by `POC.validate` — callers that replace the set must clear it first or validate
+re-appends the old value. `is_primary` is retired: `sender.reply_address` now falls back
+by role (division POC first, then a Lead overseeing it) rather than reading it.
+
+**`Client.product` is likewise legacy**, superseded by **Client Product** — a client runs
+several products, each optionally scoped to divisions, with its own dates. An empty
+`divisions` table there means "attached to the client as a whole", which is the only shape
+available to a client with no divisions.
+
+Both legacy columns are populated but no longer read by the code that replaced them; they
+come out once the new model has run in production. See
+`patches/backfill_contact_divisions_and_products.py`.
 
 Several of these are autonamed from a human-readable field *and* are Link targets
 elsewhere — so editing that field is a **rename**, not a field update. That is why
@@ -62,10 +95,23 @@ inbound links.
 
 | DocType | Parent | Fields |
 | --- | --- | --- |
-| **Ticket Message** | Support Ticket | kind (`client`/`team`), author, role, message_on, body, attachments |
+| **Ticket Message** | Support Ticket | kind (`client`/`team`), author, role, message_on, body, attachments, source_communication |
 | **Work Note** | Support Ticket | author, note_on, body, attachments |
+| **Ticket Activity** | Support Ticket | action (Created/Status/Priority/Assignee/Team/Collaborator), old_value, new_value, author, acted_on |
 | **Ticket Collaborator** | Support Ticket | party_type, team, member, added_by, added_on |
+| **POC Division** | POC | division — *the contact's ticket scope* |
+| **Client Product Division** | Client Product | division — empty means client-wide |
 | **Assignment Group Member** | Assignment Group | member |
+
+### Standalone records
+
+Not child tables, but owned by a ticket rather than by the org:
+
+| DocType | Named by | Purpose |
+| --- | --- | --- |
+| **Ticket Email Log** | hash | Outbound audit trail — kind, recipient, subject, message_id, delivery_state (Queued/Sent/Failed/Bounced). Reconciled from Email Queue by a scheduled job, because Email Queue writes its status with `db.set_value` and fires no doc events |
+| **Ticket Read Receipt** | hash | One row per (ticket, user). Per-user, so one agent reading a reply doesn't clear the dot for the rest of the team |
+| **No Reply Rule** | `pattern` | Operator-managed no-reply overrides — pattern + match_type (Exact/Prefix/Domain/Regex). Layer 1 of `sender.no_reply_reason`, and it wins over the built-in conventions |
 
 ---
 
@@ -80,7 +126,7 @@ fresh site always has them before DocPerms reference them.
 | --- | --- | --- |
 | **Support Team** | yes | Agents. Work tickets; read-only on org masters. |
 | **Support Manager** | yes | Adds management of clients, divisions, POCs, members, teams, products. Granted on top of Support Team. |
-| **Support Client** | no | Portal only. Sees their own division's tickets. |
+| **Support Client** | no | Portal only. Sees the tickets of the divisions they hold — a set, not one. An empty set sees nothing. |
 
 ### How isolation is enforced
 
@@ -103,16 +149,24 @@ Client           -> client_has_permission   + manager_write_gate
 Division         -> division_has_permission + manager_write_gate
 POC              -> manager_write_gate
 Product          -> manager_write_gate
+Client Product   -> manager_write_gate
 Team Member      -> manager_write_gate
 Assignment Group -> manager_write_gate
 ```
 
-`manager_write_gate` covers **all six** org masters, not just the tenant-scoped ones.
+`manager_write_gate` covers **all seven** org masters, not just the tenant-scoped ones.
 That matters because the DocPerms grant Support Team full CRUD on every master — the gate
 is the only thing stopping an agent creating or deleting Products, Team Members and
 Assignment Groups. The manager-only API endpoints are not the enforcement point: a client
 of this backend can reach the same doctypes through `/api/resource/*`, bypassing them
 entirely, so the check has to live in the permission layer.
+
+**Every master needs its own line here — a missing one fails open, silently.** Client
+Product shipped without one and was, for as long as that lasted, the single master any
+agent could create, edit and delete. Nothing surfaced it: the endpoints still called
+`_require_manager`, so the UI behaved correctly and only a direct REST call showed the
+gap. `tests/test_manager_gate.py` now asserts the rule over the whole master list, both
+behaviourally and structurally, so the next master added without a gate fails the suite.
 
 Both layers matter. The query conditions stop a client seeing others' rows in a list;
 `has_permission` stops them fetching one by guessing its name. `manager_write_gate` is
