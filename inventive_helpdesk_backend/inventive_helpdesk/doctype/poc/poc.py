@@ -18,15 +18,34 @@ class POC(Document):
         if self.email and (self.is_new() or self.has_value_changed("email")):
             assert_email_unclaimed(self.doctype, self.name, self.email)
 
-        # Cross-field integrity: a POC's division must belong to its client —
-        # tenant isolation scopes portal users by POC.division, so a mismatched
-        # pair would scope a user to another client's division.
-        if self.client and self.division:
+        # Cross-field integrity: every division a POC holds must belong to its client.
+        # Tenant isolation scopes portal users by exactly this list, so one mismatched row
+        # would hand somebody another client's tickets — the check is load-bearing, not
+        # cosmetic. An EMPTY list is legal and means "no ticket access yet": that is the
+        # state a Lead is created in, before anyone assigns them divisions.
+        seen = set()
+        for row in self.divisions or []:
+            if not row.division:
+                continue
+            div_client = frappe.db.get_value("Division", row.division, "client")
+            if div_client != self.client:
+                frappe.throw(
+                    _("Division {0} belongs to {1}, not {2}").format(row.division, div_client, self.client)
+                )
+            if row.division in seen:
+                frappe.throw(_("{0} is listed twice for this contact").format(row.division))
+            seen.add(row.division)
+
+        # Legacy single-division column, still written by pre-migration callers. Keep it
+        # consistent with the table so the retained field can't drift into a lie while it
+        # waits to be dropped.
+        if self.division and self.division not in seen:
             div_client = frappe.db.get_value("Division", self.division, "client")
             if div_client != self.client:
                 frappe.throw(
                     _("Division {0} belongs to {1}, not {2}").format(self.division, div_client, self.client)
                 )
+            self.append("divisions", {"division": self.division})
 
     def on_trash(self):
         # Deleting a POC (directly, or cascaded when its division/client is removed)

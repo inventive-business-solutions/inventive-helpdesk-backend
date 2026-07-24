@@ -117,6 +117,30 @@ def no_reply_reason(email: str) -> str | None:
     return None
 
 
+def _division_poc_email(division, poc_name=None, leads=None) -> str | None:
+    """Email of a contact who holds `division`, oldest first so the pick is deterministic.
+
+    Contacts hold divisions through the POC Division child table, so this joins rather than
+    matching a column. `poc_name` narrows to a named person; `leads` selects only Leads
+    (True) or only division POCs (False), or either when None.
+    """
+    if not division:
+        return None
+    filters = {"parenttype": "POC", "division": division}
+    rows = frappe.get_all("POC Division", filters=filters, pluck="parent")
+    if not rows:
+        return None
+    poc_filters = {"name": ["in", rows]}
+    if poc_name:
+        poc_filters["poc_name"] = poc_name
+    if leads is not None:
+        poc_filters["is_lead"] = 1 if leads else 0
+    email = frappe.get_all(
+        "POC", filters=poc_filters, pluck="email", order_by="creation asc", limit=1
+    )
+    return email[0].strip().lower() if email and email[0] else None
+
+
 def reply_address(ticket) -> str | None:
     """The address a reply to this ticket would go to.
 
@@ -131,13 +155,17 @@ def reply_address(ticket) -> str | None:
         return owner.strip().lower()
     div, raised_by = getattr(ticket, "division", None), getattr(ticket, "raised_by", None)
     if div and raised_by:
-        email = frappe.db.get_value("POC", {"division": div, "poc_name": raised_by}, "email")
+        email = _division_poc_email(div, poc_name=raised_by)
         if email:
-            return email.strip().lower()
+            return email
     if div:
-        email = frappe.db.get_value("POC", {"division": div, "is_primary": 1}, "email")
+        # `is_primary` used to pick the addressee here. It was retired when Leads arrived,
+        # so fall back by role instead: a division's own POC first, then a Lead who oversees
+        # that division. Ordered by creation so the answer is stable rather than whichever
+        # row the DB happens to return.
+        email = _division_poc_email(div, leads=False) or _division_poc_email(div, leads=True)
         if email:
-            return email.strip().lower()
+            return email
     return None
 
 
@@ -248,17 +276,22 @@ def refresh_for_poc(poc_name: str) -> int:
 
     Both sets are bounded (one contact, one division), so this is safe inline on invite.
     """
-    poc = frappe.db.get_value("POC", poc_name, ["email", "division"], as_dict=True)
+    poc = frappe.db.get_value("POC", poc_name, ["name", "email"], as_dict=True)
     if not poc or not poc.email:
         return 0
     email = poc.email.strip().lower()
 
     names = set(frappe.get_all("Support Ticket", filters={"from_email": email}, pluck="name", limit=2000))
-    if poc.division:
+    # A contact can hold several divisions now, so sweep all of them — bounded by one
+    # contact's divisions rather than one division, but still bounded.
+    divisions = frappe.get_all(
+        "POC Division", filters={"parent": poc.name, "parenttype": "POC"}, pluck="division"
+    )
+    if divisions:
         names.update(
             frappe.get_all(
                 "Support Ticket",
-                filters={"division": poc.division, "from_email": ["in", ["", None]]},
+                filters={"division": ["in", divisions], "from_email": ["in", ["", None]]},
                 pluck="name",
                 limit=2000,
             )

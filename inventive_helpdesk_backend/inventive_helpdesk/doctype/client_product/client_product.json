@@ -1,0 +1,80 @@
+{
+ "actions": [],
+ "allow_rename": 1,
+ "autoname": "hash",
+ "creation": "2026-07-23 09:00:00.000000",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "client",
+  "product",
+  "dev_start",
+  "expected_completion",
+  "divisions"
+ ],
+ "fields": [
+  {
+   "fieldname": "client",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Client",
+   "options": "Client",
+   "reqd": 1
+  },
+  {
+   "fieldname": "product",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Product",
+   "options": "Product",
+   "reqd": 1
+  },
+  {
+   "fieldname": "dev_start",
+   "fieldtype": "Date",
+   "in_list_view": 1,
+   "label": "Dev Start Date"
+  },
+  {
+   "fieldname": "expected_completion",
+   "fieldtype": "Date",
+   "in_list_view": 1,
+   "label": "Expected Completion"
+  },
+  {
+   "description": "Divisions this product is deployed to. Leave empty to attach it to the client as a whole.",
+   "fieldname": "divisions",
+   "fieldtype": "Table",
+   "label": "Divisions",
+   "options": "Client Product Division"
+  }
+ ],
+ "grid_page_length": 50,
+ "index_web_pages_for_search": 1,
+ "links": [],
+ "modified": "2026-07-23 09:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Inventive Helpdesk",
+ "name": "Client Product",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "Support Team",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "row_format": "Dynamic",
+ "rows_threshold_for_grid_search": 20,
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": []
+}

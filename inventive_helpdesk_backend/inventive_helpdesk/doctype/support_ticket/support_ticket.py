@@ -98,10 +98,21 @@ class SupportTicket(Document):
             self.ticket_type = "Query"
             if not self.priority:
                 self.priority = "Medium"
-            poc = frappe.db.get_value("POC", {"email": addr}, ["poc_name", "client", "division"], as_dict=True)
+            poc = frappe.db.get_value("POC", {"email": addr}, ["name", "poc_name", "client"], as_dict=True)
             if poc:
                 self.client = poc.client
-                self.division = poc.division
+                # A contact may hold several divisions (a Lead overseeing a few), and an
+                # inbound email doesn't say which one it's about. Take the first only when
+                # it's unambiguous; otherwise leave `division` blank so the ticket lands in
+                # the shared triage inbox for an agent to route, rather than guessing wrong
+                # and hiding it from the division that should see it.
+                divisions = frappe.get_all(
+                    "POC Division",
+                    filters={"parent": poc.name, "parenttype": "POC"},
+                    pluck="division",
+                    order_by="idx",
+                )
+                self.division = divisions[0] if len(divisions) == 1 else None
                 if not self.raised_by:
                     self.raised_by = poc.poc_name
             elif not self.raised_by:
@@ -227,10 +238,18 @@ class SupportTicket(Document):
         # transaction, so a failed insert rolls the number back too.
         if self.name:
             return
-        if self.client and self.division:
+        # A client with no divisions is a legitimate shape, and its tickets used to fall
+        # through to INB- — the pool for mail we could not attribute to anyone. That made a
+        # known client's ticket indistinguishable from an unidentified one, and made every
+        # such client share one global counter. Fall back to the client on its own instead;
+        # INB- now means only what its name says.
+        if self.client:
             cc = frappe.db.get_value("Client", self.client, "client_code") or _slug(self.client)
-            dc = frappe.db.get_value("Division", self.division, "division_code") or _slug(self.division)
-            prefix = f"{cc}-{dc}-"
+            if self.division:
+                dc = frappe.db.get_value("Division", self.division, "division_code") or _slug(self.division)
+                prefix = f"{cc}-{dc}-"
+            else:
+                prefix = f"{cc}-"
         else:
             prefix = "INB-"
         self._ensure_series_floor(prefix)
@@ -264,8 +283,12 @@ class SupportTicket(Document):
         rows = frappe.db.sql("select name from `tabSupport Ticket` where name like %s", prefix + "%")
         floor = 0
         for (nm,) in rows:
-            try:
-                floor = max(floor, int(nm.rsplit("-", 1)[1]))
-            except (IndexError, ValueError):
-                continue
+            # Only names that are this prefix followed by nothing but digits. LIKE alone is
+            # too loose now that a client-only prefix exists: "MSFT-%" also matches
+            # "MSFT-AZU-0001", and seeding the client's counter from its divisions' tickets
+            # would make the numbering jump for no visible reason. Slicing by prefix length
+            # (rather than rsplit) is also what keeps a 5-digit suffix countable past 9999.
+            suffix = nm[len(prefix):]
+            if suffix.isdigit():
+                floor = max(floor, int(suffix))
         frappe.db.sql("insert ignore into `tabSeries` (name, current) values (%s, %s)", (prefix, floor))

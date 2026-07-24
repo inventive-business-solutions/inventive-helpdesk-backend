@@ -18,8 +18,10 @@ import json
 import frappe
 from frappe import _
 from frappe.model.rename_doc import rename_doc
+from frappe.rate_limiter import rate_limit
 from frappe.sessions import get_csrf_token
 from frappe.utils import cint, now_datetime
+from frappe.utils.password import get_password_reset_limit
 
 from inventive_helpdesk_backend.access import assert_user_unclaimed
 from inventive_helpdesk_backend.permissions import MANAGER_ROLES, TEAM_ROLES
@@ -45,6 +47,24 @@ def _require_manager():
 
 def _author() -> str:
     return frappe.db.get_value("User", frappe.session.user, "full_name") or frappe.session.user
+
+
+def _as_list(value) -> list:
+    """Coerce a whitelisted endpoint's list argument to a real list.
+
+    A JSON request body arrives already decoded, but the same call made as form data (or
+    via `frappe.call`) delivers the array as a JSON *string* — so a bare `for x in value`
+    would silently iterate the characters of "[\"a\"]" and write garbage rows. Anything
+    unparseable is treated as empty rather than raising: these feed permission scopes, and
+    an empty scope denies, which is the safe direction to fail."""
+    if not value:
+        return []
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (ValueError, TypeError):
+            return []
+    return list(value) if isinstance(value, (list, tuple, set)) else []
 
 
 def _norm_attachments(attachments) -> str:
@@ -94,13 +114,27 @@ def me():
             if member else []
         )
         ctx["is_agent"] = not ctx["manage"]
-    poc = frappe.db.get_value("POC", {"user": user}, ["client", "division"], as_dict=True)
+    poc = frappe.db.get_value("POC", {"user": user}, ["name", "client", "is_lead"], as_dict=True)
     if poc:
-        d = frappe.db.get_value("Division", poc.division, ["division_name", "division_code"], as_dict=True) or {}
+        divisions = frappe.get_all(
+            "POC Division",
+            filters={"parent": poc.name, "parenttype": "POC"},
+            pluck="division",
+            order_by="idx",
+        )
+        # `divisions` is the real scope — a contact may hold several, and a Lead may hold
+        # none at all (no ticket access yet). The singular keys below are the FIRST entry,
+        # kept only so views that still read `session.division` keep working; they are not
+        # the authority and must not be used for filtering.
+        first = divisions[0] if divisions else None
+        d = (frappe.db.get_value("Division", first, ["division_name", "division_code"], as_dict=True)
+             if first else None) or {}
         ctx.update({
             "client": poc.client,
-            "division": poc.division,
-            "division_name": d.get("division_name") or poc.division,
+            "is_lead": bool(poc.is_lead),
+            "divisions": divisions,
+            "division": first,
+            "division_name": d.get("division_name") or first,
             "division_code": d.get("division_code") or "",
         })
     return ctx
@@ -422,7 +456,7 @@ def update_member(name, member_name=None, title=None, email=None):
 
 # ---- client / POC administration (staff only) -----------------------------
 @frappe.whitelist(methods=["POST"])
-def update_client(name, client_name=None, client_code=None, since=None, product=None):
+def update_client(name, client_name=None, client_code=None, since=None, status=None, product=None):
     """Edit a client, including a rename. `name` (autonamed from client_name) is a
     Link target on Support Ticket, Division and POC, so frappe.rename_doc cascades
     the new name to every reference. `product` is a Product docname ("" clears it)."""
@@ -432,6 +466,8 @@ def update_client(name, client_name=None, client_code=None, since=None, product=
         doc.client_code = client_code
     if since is not None:
         doc.since = since or None
+    if status:
+        doc.status = status
     if product is not None:
         doc.product = product or None
     doc.save(ignore_permissions=True)
@@ -455,7 +491,7 @@ def update_product(name, product_name=None):
 
 
 @frappe.whitelist(methods=["POST"])
-def update_poc(name, poc_name=None, email=None, is_primary=None):
+def update_poc(name, poc_name=None, email=None, phone=None, divisions=None, is_primary=None):
     """Edit a POC. POC is autonamed by `email`, so a changed email must rename the
     doc — and if the POC already has a portal login, the User is renamed too so the
     sign-in address stays in sync (that link is how me()/permissions scope them).
@@ -475,8 +511,16 @@ def update_poc(name, poc_name=None, email=None, is_primary=None):
         frappe.throw(_("Another user already signs in as {0} — the POC email must be unique").format(new_email))
     if poc_name is not None:
         doc.poc_name = poc_name
+    if phone is not None:
+        doc.phone = phone or None
     if is_primary is not None:
         doc.is_primary = cint(is_primary)
+    if divisions is not None:
+        # Replace wholesale rather than merge: the caller sends the complete set, so a
+        # division removed in the UI must actually lose access. Clearing the legacy single
+        # column too, or POC.validate would silently re-append the old division.
+        doc.division = None
+        doc.set("divisions", [{"division": d} for d in _as_list(divisions) if d])
     if new_email:
         doc.email = new_email
     doc.save(ignore_permissions=True)
@@ -494,6 +538,87 @@ def update_poc(name, poc_name=None, email=None, is_primary=None):
             # requires write on User, which a Support Manager without System Manager
             # doesn't have.
             rename_doc("User", linked_user, new_email, force=True, ignore_permissions=True)
+    return name
+
+
+@frappe.whitelist(methods=["POST"])
+def create_contact(client, poc_name, email, phone=None, divisions=None, is_lead=0):
+    """Create a client contact — a division POC or a client Lead, same record either way.
+
+    `divisions` may be empty, and for a Lead usually is at creation: they are added during
+    client onboarding, before any division exists. An empty set means no ticket access
+    until someone assigns them, which is deliberate (see permissions._poc)."""
+    _require_manager()
+    doc = frappe.get_doc({
+        "doctype": "POC",
+        "client": client,
+        "poc_name": poc_name,
+        "email": (email or "").strip(),
+        "phone": phone or None,
+        "is_lead": cint(is_lead),
+        "divisions": [{"division": d} for d in _as_list(divisions) if d],
+    })
+    doc.insert(ignore_permissions=True)
+    return doc.name
+
+
+@frappe.whitelist(methods=["POST"])
+def set_contact_divisions(name, divisions):
+    """Replace the divisions a contact can see. This IS the access-granting call — the set
+    given here becomes their entire ticket scope, so anything omitted loses access."""
+    _require_manager()
+    doc = frappe.get_doc("POC", name)
+    doc.division = None  # legacy column; POC.validate would otherwise re-append it
+    doc.set("divisions", [{"division": d} for d in _as_list(divisions) if d])
+    doc.save(ignore_permissions=True)
+    return doc.name
+
+
+# ---- client products (the "product" a client runs, per division or client-wide) ----
+def _client_product_payload(client, product, dev_start, expected_completion, divisions):
+    return {
+        "client": client,
+        "product": product,
+        "dev_start": dev_start or None,
+        "expected_completion": expected_completion or None,
+        # Empty means "attached to the client as a whole" — the only shape available to a
+        # client with no divisions, and a legitimate choice even when it has some.
+        "divisions": [{"division": d} for d in _as_list(divisions) if d],
+    }
+
+
+@frappe.whitelist(methods=["POST"])
+def create_client_product(client, product, dev_start=None, expected_completion=None, divisions=None):
+    """Attach a product to a client, optionally scoped to specific divisions."""
+    _require_manager()
+    doc = frappe.get_doc({
+        "doctype": "Client Product",
+        **_client_product_payload(client, product, dev_start, expected_completion, divisions),
+    })
+    doc.insert(ignore_permissions=True)
+    return doc.name
+
+
+@frappe.whitelist(methods=["POST"])
+def update_client_product(name, product=None, dev_start=None, expected_completion=None, divisions=None):
+    _require_manager()
+    doc = frappe.get_doc("Client Product", name)
+    if product is not None:
+        doc.product = product
+    if dev_start is not None:
+        doc.dev_start = dev_start or None
+    if expected_completion is not None:
+        doc.expected_completion = expected_completion or None
+    if divisions is not None:
+        doc.set("divisions", [{"division": d} for d in _as_list(divisions) if d])
+    doc.save(ignore_permissions=True)
+    return doc.name
+
+
+@frappe.whitelist(methods=["POST"])
+def delete_client_product(name):
+    _require_manager()
+    frappe.delete_doc("Client Product", name, ignore_permissions=True)
     return name
 
 
@@ -572,17 +697,19 @@ def _ensure_login_user(email, full_name, user_type, role, owner_doctype=None, ow
     return user
 
 
-def _invite_email_html(user, link):
-    """Branded set-password email body. Indigo accent matches the app's design system."""
+def _action_email_html(user, link, heading, intro, cta):
+    """Branded one-button email body. Indigo accent matches the app's design system.
+    Shared by the invite and the password reset so both land on our own /set-password
+    page and read as the same product."""
     name = frappe.utils.escape_html(user.first_name or user.email)
     return f"""
 <div style="font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;max-width:520px;margin:0 auto;color:#1e2230;">
-  <h2 style="font-size:20px;font-weight:700;margin:0 0 6px;">Welcome to Inventive Helpdesk</h2>
+  <h2 style="font-size:20px;font-weight:700;margin:0 0 6px;">{heading}</h2>
   <p style="font-size:14px;line-height:1.6;color:#464b5c;margin:0 0 18px;">
-    Hi {name}, an account has been created for you. Set a password to activate it and sign in.
+    Hi {name}, {intro}
   </p>
   <p style="margin:0 0 22px;">
-    <a href="{link}" style="display:inline-block;background:#4f46e5;color:#fff;text-decoration:none;font-weight:600;font-size:14px;padding:11px 20px;border-radius:9px;">Set your password</a>
+    <a href="{link}" style="display:inline-block;background:#4f46e5;color:#fff;text-decoration:none;font-weight:600;font-size:14px;padding:11px 20px;border-radius:9px;">{cta}</a>
   </p>
   <p style="font-size:12.5px;line-height:1.6;color:#6b7182;margin:0 0 6px;">Or paste this link into your browser:</p>
   <p style="font-size:12.5px;word-break:break-all;margin:0 0 22px;"><a href="{link}" style="color:#4f46e5;">{link}</a></p>
@@ -590,6 +717,24 @@ def _invite_email_html(user, link):
     If you weren't expecting this, you can safely ignore this email.
   </p>
 </div>""".strip()
+
+
+def _invite_email_html(user, link):
+    return _action_email_html(
+        user, link,
+        heading=_("Welcome to Inventive Helpdesk"),
+        intro=_("an account has been created for you. Set a password to activate it and sign in."),
+        cta=_("Set your password"),
+    )
+
+
+def _reset_email_html(user, link):
+    return _action_email_html(
+        user, link,
+        heading=_("Reset your password"),
+        intro=_("we received a request to reset your Inventive Helpdesk password. Choose a new one below — the link works once and expires."),
+        cta=_("Choose a new password"),
+    )
 
 
 def _send_invite_mail(user, context):
@@ -617,6 +762,55 @@ def _send_invite_mail(user, context):
     except (frappe.OutgoingEmailError, frappe.ValidationError):
         frappe.log_error(title=f"{context} invite email failed")
         return False
+
+
+@frappe.whitelist(allow_guest=True, methods=["POST"])
+@rate_limit(limit=get_password_reset_limit, seconds=60 * 60)
+def request_password_reset(user):
+    """Email a password-reset link that lands on OUR app, not the Frappe desk.
+
+    frappe.core.doctype.user.user.reset_password builds its link with get_url(), which
+    resolves to the backend host — so "Forgot password" mailed people a link to
+    helpdeskfrappe…/update-password, Frappe's own desk page. Wrong product, wrong
+    branding, and a portal client has no business on the desk at all. The invite flow
+    already retargets the key at app_url + /set-password; this does the same for resets.
+
+    Enumeration-safe, mirroring the upstream contract (CWE-204): the response is identical
+    whether the address exists, is disabled, or is the Administrator, and every failure is
+    swallowed into that same answer rather than surfacing as a distinguishable error.
+    Rate-limited on the same budget as upstream, since this endpoint sends mail to an
+    address chosen by an unauthenticated caller."""
+    try:
+        user_doc = frappe.get_doc("User", user)
+        if user_doc.name != "Administrator" and user_doc.enabled:
+            user_doc.validate_reset_password()
+            app_url = (frappe.conf.get("app_url") or "").rstrip("/")
+            if app_url:
+                # Mints a fresh one-time key (stored hashed) and returns a URL holding the
+                # raw key; we keep the key and drop Frappe's URL.
+                key = user_doc._reset_password().split("key=", 1)[1]
+                frappe.sendmail(
+                    recipients=[user_doc.email],
+                    subject=_("Reset your Inventive Helpdesk password"),
+                    message=_reset_email_html(user_doc, f"{app_url}/set-password?key={key}"),
+                    now=True,
+                )
+            else:
+                # No app_url configured: better a desk link than no email at all.
+                user_doc._reset_password(send_email=True)
+    except frappe.DoesNotExistError:
+        frappe.clear_messages()
+    except frappe.OutgoingEmailError:
+        frappe.clear_messages()
+        frappe.log_error(title="Password reset email could not be sent", message=frappe.get_traceback())
+    except Exception:
+        frappe.clear_messages()
+        frappe.log_error(title="Password reset failed unexpectedly", message=frappe.get_traceback())
+
+    frappe.msgprint(
+        msg=_("If this email is registered with us, we have sent password reset instructions to it. Please check your inbox."),
+        title=_("Password Reset"),
+    )
 
 
 @frappe.whitelist(methods=["POST"])

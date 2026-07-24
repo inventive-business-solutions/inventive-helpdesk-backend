@@ -132,6 +132,26 @@ class TestSupportTicket(IntegrationTestCase):
         t = make_ticket(title="Unscoped")
         self.assertTrue(t.name.startswith("INB-"))
 
+    def test_client_without_division_uses_the_client_prefix(self):
+        # A client with no divisions is a legitimate shape, and its tickets used to fall
+        # through to INB- — the pool for mail we could not attribute to anyone. A known
+        # client's ticket must be identifiable as theirs, and carry its own counter.
+        client_d = make_client("_Test IC Client D", "ZTD")
+        t = make_ticket(client=client_d)
+        self.assertEqual(t.name, "ZTD-0001")
+
+    def test_client_prefix_floor_ignores_its_divisions_tickets(self):
+        # The floor scan is a LIKE on "<prefix>%", and "ZTE-%" also matches "ZTE-DEL-0001".
+        # Seeding the client-only counter from its divisions' tickets would start it above
+        # them for no reason a user could explain, so the scan must only count names that
+        # are the prefix followed by nothing but digits.
+        client_e = make_client("_Test IC Client E", "ZTE")
+        div_e = make_division(client_e, "Delta", "DEL")
+        scoped = make_ticket(client=client_e, division=div_e)
+        self.assertEqual(scoped.name, "ZTE-DEL-0001")
+        unscoped = make_ticket(client=client_e)
+        self.assertEqual(unscoped.name, "ZTE-0001")
+
     def test_autoname_skips_past_explicit_insert_after_series_exists(self):
         # The floor only applies on a prefix's FIRST use. A later out-of-band
         # explicit-name insert (Data Import, manual backfill) can still land on
