@@ -17,6 +17,22 @@
 x-custom-image: &custom_image
   image: ${IMAGE_NAME:?No image set}:${VERSION:?No version set}
 
+# Error reporting. Frappe initialises the Sentry SDK itself when this variable is set —
+# frappe/app.py:439 for the gunicorn web process, frappe/utils/background_jobs.py:742 for
+# the workers and scheduler — so there is no app code to write, only this wiring.
+#
+# It MUST reach the workers, not just `backend`. Most of what this app does that can fail
+# quietly happens in a background job, by design: _send_invite_mail, _log_outgoing and
+# _anchor_outgoing all catch their exception and carry on so a mail problem can never cost
+# the ticket action that triggered it, and reconcile_email_log runs on the scheduler. That
+# is the right behaviour and it is exactly why those paths need somewhere to report — on
+# `backend` alone this would watch the one process least likely to be where the failure is.
+#
+# Unset is the safe default and the normal state for a site without a DSN: both call sites
+# check the variable and return early, so nothing initialises and nothing is sent.
+x-sentry-env: &sentry_env
+  FRAPPE_SENTRY_DSN: ${FRAPPE_SENTRY_DSN:-}
+
 services:
   backend:
     <<: *custom_image
@@ -43,6 +59,7 @@ services:
       # NB: USE_PROXY (Frappe's own ProxyFix switch) does NOT work here. It is only
       # applied inside frappe/app.py's serve(), the `bench serve` dev server; gunicorn
       # imports frappe.app:application directly and never runs that code path.
+      <<: *sentry_env
       FORWARDED_ALLOW_IPS: "*"
     deploy:
       restart_policy:
@@ -103,6 +120,8 @@ services:
       restart_policy:
         condition: any
     command: bench worker --queue default
+    environment:
+      <<: *sentry_env
     volumes:
       - sites:/home/frappe/frappe-bench/sites
     networks:
@@ -120,6 +139,8 @@ services:
       restart_policy:
         condition: any
     command: bench worker --queue long,default,short
+    environment:
+      <<: *sentry_env
     volumes:
       - sites:/home/frappe/frappe-bench/sites
     networks:
@@ -137,6 +158,8 @@ services:
       restart_policy:
         condition: any
     command: bench worker --queue short,default
+    environment:
+      <<: *sentry_env
     volumes:
       - sites:/home/frappe/frappe-bench/sites
     networks:
@@ -154,6 +177,8 @@ services:
       restart_policy:
         condition: any
     command: bench schedule
+    environment:
+      <<: *sentry_env
     volumes:
       - sites:/home/frappe/frappe-bench/sites
     networks:
@@ -341,6 +366,26 @@ services:
       - bench-network
       - mariadb-network
 
+  # `--with-files` is not optional here, despite what a database-only dump looks like in a
+  # backup listing. Ticket attachments are stored as FILES on the sites volume and only
+  # their metadata lives in the database, so a db-only restore brings back every ticket
+  # with every attachment link intact and every file behind those links gone. For an
+  # after-sales desk the attachment IS frequently the ticket — the screenshot of the fault,
+  # the log, the signed-off report — so that restore silently loses the evidence while
+  # looking complete.
+  #
+  # This does not grow without bound. new_backup() calls delete_temp_backups() on every run
+  # (frappe/utils/backups.py:625, :651), which prunes the backup directory at
+  # `keep_backups_for_hours` — default 23. At a 6-hourly schedule that keeps roughly four
+  # sets, each of which now also carries a copy of the public and private file trees.
+  #
+  # Two things this still does NOT solve, both tracked separately:
+  #   1. The backups are written to the SAME volume they back up. Losing that volume loses
+  #      the site and every backup of it in one step.
+  #   2. That 23-hour prune means nothing survives past a day, so a corruption or bad
+  #      delete noticed on Monday about Friday has no backup to go back to.
+  # An off-site copy with its own retention is what closes both; until then this service
+  # protects against accidental data loss inside a healthy site, not against losing the host.
   backup-sites:
     <<: *custom_image
     deploy:
@@ -354,7 +399,7 @@ services:
         condition: none
     entrypoint: ["bash", "-c"]
     command:
-      - bench --site all backup
+      - bench --site all backup --with-files
     volumes:
       - sites:/home/frappe/frappe-bench/sites
     networks:
