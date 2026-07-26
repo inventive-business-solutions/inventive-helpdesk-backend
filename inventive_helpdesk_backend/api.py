@@ -396,6 +396,159 @@ def mark_ticket_read(ticket: str):
     return ticket
 
 
+# ---- dashboard aggregates -------------------------------------------------
+# Every figure on the dashboard was computed in the browser by filtering the full ticket
+# array — which is why the array had to be the full ticket set in the first place, and why
+# capping that fetch made the figures quietly too small. Counting here removes the reason
+# the browser needed every row.
+#
+# These MUST mirror the frontend's own classification exactly (lib/helpers.ts), or the
+# dashboard and the ticket list disagree about the same word. Kept adjacent and named the
+# same so a change to one is an obvious prompt to change the other.
+_ACTIVE_STATUSES = ("New", "Acknowledged", "In Progress", "Pending Client", "Reopened")
+_RESOLVED_STATUSES = ("Resolved", "Closed")
+# helpers.needsAttention: New, or Pending Client for this long, or an active SLA risk.
+_PENDING_CLIENT_STALE_DAYS = 5
+
+
+def _stat_count(filters) -> int:
+    """One permission-scoped COUNT.
+
+    `get_list`, never `get_all` or db.sql: permission_query_conditions apply to the former
+    only, and an aggregate that ignores them reports OTHER TENANTS' totals — a smaller leak
+    than listing their tickets but the same boundary. Verified against a two-client fixture
+    in tests/test_ticket_stats.py rather than assumed.
+
+    The dict form is required by v16 — a "count(name)" string is rejected outright — and
+    the result key is the rendered SQL, so read the single value rather than name it.
+    """
+    rows = frappe.get_list("Support Ticket", filters=filters, fields=[{"COUNT": "name"}], limit=0)
+    return int(next(iter(rows[0].values()))) if rows else 0
+
+
+def _stat_group(field: str, filters=None) -> dict:
+    """Permission-scoped COUNT grouped by one field. Empty/NULL groups key on ""."""
+    rows = frappe.get_list(
+        "Support Ticket",
+        filters=filters or {},
+        fields=[field, {"COUNT": "name"}],
+        group_by=field,
+        limit=0,
+    )
+    out = {}
+    for row in rows:
+        # The count column is whichever key is not the grouping field; its name is the
+        # rendered SQL ("COUNT(`name`)") and is not worth depending on.
+        count = next(v for k, v in row.items() if k != field)
+        out[row.get(field) or ""] = int(count)
+    return out
+
+
+def _needs_attention_count(active_filter) -> int:
+    """Tickets needing attention, counted without double counting.
+
+    helpers.needsAttention is a disjunction — New, OR Pending Client and stale, OR an SLA
+    risk that is still active — and the three overlap: a New ticket flagged at risk
+    satisfies two of them and is ONE ticket. Frappe's or_filters cannot express a
+    conjunction inside a disjunction anyway, so this counts four disjoint sets instead:
+
+      New  +  (Pending Client & stale)  +  (at risk & neither of those)
+
+    split in two because "neither of those" spans both a status set and a date.
+    """
+    cutoff = add_days(now_datetime(), -_PENDING_CLIENT_STALE_DAYS)
+    # Active statuses that are neither New nor Pending Client — an SLA risk here is only
+    # counted by this term.
+    other_active = [s for s in _ACTIVE_STATUSES if s not in ("New", "Pending Client")]
+    return (
+        _stat_count({"status": "New"})
+        + _stat_count({"status": "Pending Client", "creation": ["<=", cutoff]})
+        + _stat_count({"sla_risk": 1, "status": ["in", other_active]})
+        # A Pending Client ticket NOT yet stale, so not already counted above.
+        + _stat_count({"sla_risk": 1, "status": "Pending Client", "creation": [">", cutoff]})
+    )
+
+
+def _trend(weeks: int) -> list:
+    """Weekly created-vs-resolved buckets, anchored on the most recent ticket.
+
+    Anchored on the latest ticket rather than today, matching the chart this replaces — on
+    a quiet site an empty trailing week reads as an outage rather than a quiet week.
+
+    This one reads rows rather than grouping, because the buckets are seven-day windows
+    from a moving anchor and expressing that as SQL would tie the result to one database's
+    date functions. It is bounded by the window: two columns for the tickets created in it,
+    not every ticket ever.
+    """
+    latest = frappe.get_list(
+        "Support Ticket", fields=["creation"], order_by="creation desc", limit=1
+    )
+    if not latest:
+        return []
+    anchor = latest[0]["creation"]
+    start = add_days(anchor, -(weeks * 7 - 1))
+    rows = frappe.get_list(
+        "Support Ticket",
+        filters={"creation": [">=", start]},
+        fields=["creation", "status"],
+        limit=0,
+    )
+    buckets = []
+    for i in range(weeks - 1, -1, -1):
+        end = add_days(anchor, -i * 7)
+        begin = add_days(end, -6)
+        in_week = [r for r in rows if begin <= r["creation"] <= end]
+        buckets.append({
+            "week": f"{begin.strftime('%b')} {begin.day}",
+            "created": len(in_week),
+            "resolved": sum(1 for r in in_week if r["status"] in _RESOLVED_STATUSES),
+        })
+    return buckets
+
+
+@frappe.whitelist()
+def ticket_stats(trend_weeks=8):
+    """Dashboard figures, counted in the database and scoped to the caller.
+
+    Not staff-gated: every query below goes through get_list, so a portal contact receives
+    the same shape computed over their own divisions only. That is what makes it usable by
+    the portal as well as the two dashboards.
+    """
+    weeks = max(1, min(cint(trend_weeks) or 8, 52))
+    active = {"status": ["in", list(_ACTIVE_STATUSES)]}
+    return {
+        "counts": {
+            "total": _stat_count({}),
+            "active": _stat_count(active),
+            "resolved": _stat_count({"status": ["in", list(_RESOLVED_STATUSES)]}),
+            "needs_attention": _needs_attention_count(active),
+            "sla_risk": _stat_count({**active, "sla_risk": 1}),
+            "email": _stat_count({"source": "Email"}),
+            # Assignment gaps among open tickets: no team at all (where emailed-in tickets
+            # land) vs routed to a team but nobody has claimed it.
+            # Both conditions, matching the frontend. SupportTicket.validate rejects an
+            # assignee without a team, so "no team" should already imply "unassigned" —
+            # but that rule only fires when the assignment changes, so a row predating it
+            # can violate it, and this figure would then count a ticket somebody owns.
+            "to_system": _stat_count(
+                {**active, "assignment_group": ["is", "not set"], "assignee": ["is", "not set"]}
+            ),
+            "to_member": _stat_count(
+                {**active, "assignment_group": ["is", "set"], "assignee": ["is", "not set"]}
+            ),
+        },
+        # Status spans everything — it IS the pipeline. The rest describe open work only,
+        # matching the dashboard's own labels ("Open by priority").
+        "by_status": _stat_group("status"),
+        "by_priority": _stat_group("priority", active),
+        "by_type": _stat_group("ticket_type", active),
+        "by_client": _stat_group("client", active),
+        "by_assignee": _stat_group("assignee", active),
+        "by_team": _stat_group("assignment_group", active),
+        "trend": _trend(weeks),
+    }
+
+
 def _my_member() -> str:
     """The signed-in staff user's Team Member docname (or None). Resolved by the
     User link, matching how tickets store `assignee`."""
