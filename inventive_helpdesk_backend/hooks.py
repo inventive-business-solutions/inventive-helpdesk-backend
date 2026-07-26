@@ -43,6 +43,20 @@ has_permission = {
     "Client Product": "inventive_helpdesk_backend.permissions.manager_write_gate",
     "Team Member": "inventive_helpdesk_backend.permissions.manager_write_gate",
     "Assignment Group": "inventive_helpdesk_backend.permissions.manager_write_gate",
+    # Second occurrence of the Client Product gap, found by enumerating DocPerms against
+    # this dict rather than by reading the docs. No Reply Rule grants Support Team full
+    # CRUD and had no gate, so any agent could edit it through /api/resource/*.
+    #
+    # It is not cosmetic config. It is layer 1 of sender.no_reply_reason and WINS over the
+    # built-in conventions, so a Domain rule matching a customer's domain classifies every
+    # ticket from them as No Reply — which withholds the acknowledgement AND makes
+    # reply_plan return UNREACHABLE, so staff replies are saved to the thread and never
+    # emailed. The customer hears nothing and the agent is told the address is unreachable.
+    # NoReplyRule's own docstring already said "a manager fixes it here"; now that is true.
+    "No Reply Rule": "inventive_helpdesk_backend.permissions.manager_write_gate",
+    # Agent-writable BY DESIGN — this is where an agent records the tickets they have
+    # opened — so the gate is ownership, not rank. See own_read_receipt_gate.
+    "Ticket Read Receipt": "inventive_helpdesk_backend.permissions.own_read_receipt_gate",
 }
 
 # --- Inventive Helpdesk: email intake + client notifications ---

@@ -368,7 +368,10 @@ def unread_tickets():
         filters={"last_activity_on": [">", add_days(now_datetime(), -_UNREAD_WINDOW_DAYS)]},
         fields=["name", "last_activity_on"],
         order_by="last_activity_on desc",
-        limit_page_length=_UNREAD_LIMIT,
+        # `limit`, not `limit_page_length`: the latter is deprecated for removal in v17
+        # (frappe/model/qb_query.py:153) and emits a warning on every call — and this one
+        # runs on every agent's poll, so it would be the loudest source of it on the site.
+        limit=_UNREAD_LIMIT,
     )
     if not rows:
         return []

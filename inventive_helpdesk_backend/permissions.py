@@ -59,6 +59,33 @@ def manager_write_gate(doc, ptype=None, user=None):
     return True
 
 
+def own_read_receipt_gate(doc, ptype=None, user=None):
+    """A Ticket Read Receipt belongs to one person. Nobody else may write it.
+
+    Not manager_write_gate, because unlike the org masters this doctype is SUPPOSED to be
+    written by agents — it records which tickets they have opened. The invariant is
+    narrower: your own row, not anyone else's.
+
+    Its DocPerms grant Support Team create/write/delete and nothing constrained them, so
+    an agent could clear a colleague's unread markers, or delete them, straight through
+    /api/resource/*. That is a nuisance rather than a disclosure — the receipts hold no
+    ticket content — but the unread dot is how the team divides work, and silently marking
+    another agent's queue as read is a real way to lose a customer reply.
+
+    The app's own path is unaffected: api._mark_read writes with db.set_value and
+    insert(ignore_permissions=True), neither of which consults this.
+    """
+    if ptype not in _WRITE_PTYPES:
+        return True
+    user = user or frappe.session.user
+    if _is_manager(user):
+        return True
+    owner = doc.get("user")
+    # A create with no user yet cannot be judged on ownership; the field is required, so
+    # validation rejects it moments later. Denying here would only produce a worse message.
+    return not owner or owner == user
+
+
 @request_cache
 def _poc(user: str):
     """POC scope for a portal user: their client, and the set of divisions they hold.
