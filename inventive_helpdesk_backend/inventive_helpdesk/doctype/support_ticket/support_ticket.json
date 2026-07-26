@@ -13,6 +13,7 @@
   "col1",
   "client",
   "division",
+  "product",
   "raised_by",
   "assignee",
   "assignment_group",
@@ -86,6 +87,13 @@
    "in_list_view": 1,
    "label": "Division",
    "options": "Division"
+  },
+  {
+   "fieldname": "product",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Product",
+   "options": "Product"
   },
   {
    "fieldname": "raised_by",
