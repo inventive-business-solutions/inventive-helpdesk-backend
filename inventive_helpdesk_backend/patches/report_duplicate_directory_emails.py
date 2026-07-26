@@ -21,14 +21,14 @@ def execute():
     for doctype in ("Team Member", "POC"):
         try:
             rows = frappe.db.sql(
-                """
+                f"""
                 SELECT LOWER(TRIM(email)) AS addr, COUNT(*) AS n,
                        GROUP_CONCAT(name ORDER BY creation SEPARATOR ' | ') AS holders
-                FROM `tab{0}`
+                FROM `tab{doctype}`
                 WHERE IFNULL(TRIM(email), '') != ''
                 GROUP BY LOWER(TRIM(email))
                 HAVING COUNT(*) > 1
-                """.format(doctype),
+                """,
                 as_dict=True,
             )
         except Exception:

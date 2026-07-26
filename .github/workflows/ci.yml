@@ -50,6 +50,30 @@ jobs:
           fi
           echo "Configuration present."
 
+      # Lint BEFORE the image build. ruff takes seconds and the build takes minutes, so a
+      # style failure has no business waiting behind it — this mirrors the frontend
+      # pipeline, which gates lint, format and typecheck ahead of its build.
+      #
+      # This step did not exist, and the effect was one-sided drift: ruff was configured in
+      # pyproject.toml and .pre-commit-config.yaml, but CI ran only tests and pre-commit is
+      # not installed on every clone, so nothing actually enforced it. Three violations had
+      # accumulated by the time anyone ran it by hand.
+      #
+      # Pinned to the SAME version as .pre-commit-config.yaml. If the two drift apart then
+      # CI and the local hook disagree about identical code, and whichever a developer
+      # trusts is the wrong one. Run through a container rather than a runner-installed
+      # ruff for the same reason: the version is then a property of this file, not of
+      # whatever happens to be on the box.
+      - name: Lint (ruff)
+        env:
+          RUFF_VERSION: "0.15.22"
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD:/io" -w /io python:3-slim sh -c "
+            pip install --quiet --no-cache-dir ruff==${RUFF_VERSION} &&
+            ruff check --output-format=github inventive_helpdesk_backend
+          "
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 

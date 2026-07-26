@@ -24,7 +24,6 @@ from frappe.sessions import clear_sessions
 
 from inventive_helpdesk_backend.permissions import MANAGER_ROLES
 
-
 # Directory doctypes that can own a login, with the noun to use when reporting a clash.
 _DIRECTORY = (("Team Member", "team member"), ("POC", "client contact"))
 
