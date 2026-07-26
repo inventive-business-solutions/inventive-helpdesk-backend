@@ -8,7 +8,7 @@ import frappe
 from frappe.tests import IntegrationTestCase
 
 from inventive_helpdesk_backend import email as helpdesk_email
-from inventive_helpdesk_backend.api import mark_ticket_read, unread_tickets
+from inventive_helpdesk_backend.api import _UNREAD_WINDOW_DAYS, mark_ticket_read, unread_tickets
 
 
 class TestReplyThreading(IntegrationTestCase):
@@ -691,6 +691,35 @@ class TestUnreadMarkers(IntegrationTestCase):
         self.assertIn(self.ticket.name, unread_tickets())
         frappe.set_user(self.b)
         self.assertIn(self.ticket.name, unread_tickets())
+
+    def test_activity_older_than_the_window_is_not_reported(self):
+        """The sweep is bounded to a rolling window, and this is the edge it cuts on.
+
+        Without a bound the query returned every ticket ever given a last_activity_on, on
+        every agent's 30-second poll, and then fed all of those names into a single IN
+        clause for the read receipts. Both grow with the age of the site rather than with
+        what anyone is working on.
+        """
+        stale = frappe.get_doc({
+            "doctype": "Support Ticket",
+            "title": "Stale fixture",
+            "description": "x",
+            "ticket_type": "Query",
+            "priority": "Low",
+            "status": "New",
+            "client": self.client,
+            "division": self.division,
+        }).insert(ignore_permissions=True)
+        # One day the wrong side of the window, so the test pins the boundary rather than
+        # merely picking a date far enough back to pass either way.
+        stale.db_set(
+            "last_activity_on", frappe.utils.add_days(frappe.utils.now_datetime(), -(_UNREAD_WINDOW_DAYS + 1))
+        )
+
+        frappe.set_user(self.a)
+        reported = unread_tickets()
+        self.assertNotIn(stale.name, reported, "activity older than the window must not be reported")
+        self.assertIn(self.ticket.name, reported, "recent activity must still be reported")
 
     def test_it_never_reports_a_ticket_the_caller_cannot_read(self):
         """Scope, not just staff-or-not.

@@ -20,7 +20,7 @@ from frappe import _
 from frappe.model.rename_doc import rename_doc
 from frappe.rate_limiter import rate_limit
 from frappe.sessions import get_csrf_token
-from frappe.utils import cint, now_datetime
+from frappe.utils import add_days, cint, now_datetime
 from frappe.utils.password import get_password_reset_limit
 
 from inventive_helpdesk_backend.access import assert_user_unclaimed
@@ -243,9 +243,26 @@ def _mark_read(ticket: str, user: str | None = None):
         }).insert(ignore_permissions=True)
 
 
+# The unread sweep is bounded on two axes. It runs on every agent's 30-second poll, so its
+# cost is paid per agent per half-minute for the life of the site, and it was unbounded on
+# both: every ticket ever given a `last_activity_on`, then a second query with all of those
+# names in one IN clause. That is flat at a few hundred tickets and grows without limit.
+#
+# The window is what makes it bounded rather than merely large: an unread marker for
+# something nobody has looked at in three months is not a signal an agent is going to act
+# on, whereas anything recent is. Note it keys on ACTIVITY, not creation — a client
+# replying today to a ticket resolved last year has today's timestamp, so the case that
+# most needs the dot stays inside the window.
+#
+# The limit is a backstop for a site busy enough that even 90 days is a lot, and it is
+# ordered so the truncation drops the oldest of the recent rather than an arbitrary slice.
+_UNREAD_WINDOW_DAYS = 90
+_UNREAD_LIMIT = 500
+
+
 @frappe.whitelist()
 def unread_tickets():
-    """Ticket names with activity this agent hasn't seen. Staff only, and scoped.
+    """Ticket names with activity this agent hasn't seen. Staff only, scoped, and bounded.
 
     `get_list`, not `get_all`: get_all ignores permission_query_conditions, so it would
     report activity on every ticket on the site — including other teams' and other
@@ -253,14 +270,21 @@ def unread_tickets():
     only draws a dot on rows it already fetched through the scoped list, but the endpoint
     is whitelisted and answers a direct REST call too. The agent tier is deliberately
     narrow everywhere else in this file; it has no business being wide here.
+
+    Bounded to the last _UNREAD_WINDOW_DAYS days of activity, most recent first, capped at
+    _UNREAD_LIMIT rows. Activity older than the window stops being reported as unread —
+    a deliberate behaviour change, and the point of the bound.
     """
     _require_team()
     user = frappe.session.user
+    # `>` rather than a separate ["is", "set"]: a NULL last_activity_on fails the
+    # comparison, so this subsumes the old filter instead of stacking with it.
     rows = frappe.get_list(
         "Support Ticket",
-        filters={"last_activity_on": ["is", "set"]},
+        filters={"last_activity_on": [">", add_days(now_datetime(), -_UNREAD_WINDOW_DAYS)]},
         fields=["name", "last_activity_on"],
-        limit_page_length=0,
+        order_by="last_activity_on desc",
+        limit_page_length=_UNREAD_LIMIT,
     )
     if not rows:
         return []
