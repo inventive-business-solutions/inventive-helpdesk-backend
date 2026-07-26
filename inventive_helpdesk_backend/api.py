@@ -14,6 +14,7 @@ because each one first authorizes explicitly (_require_team / _require_read).
 Any new method added here MUST start with one of those guards.
 """
 import json
+from functools import wraps
 
 import frappe
 from frappe import _
@@ -73,6 +74,87 @@ def _norm_attachments(attachments) -> str:
     if isinstance(attachments, str):
         return attachments
     return json.dumps(attachments)
+
+
+# ---- per-user rate limits ------------------------------------------------
+# frappe's own @rate_limit is IP-based by default, and that is the wrong axis here. Every
+# agent sits behind one corporate NAT, so an IP limit on a working endpoint is a limit on
+# the whole support team at once: one person pasting a long thread of replies would lock
+# out their colleagues. The alternative the decorator offers, `key=`, reads a form field —
+# which the caller controls and can simply vary, so it bounds an honest client and not an
+# abusive one.
+#
+# So these key on the SESSION USER, which is the thing actually being limited. This is not
+# a defence against a determined attacker with many accounts; it is a bound on one
+# compromised login, a runaway retry loop, or a UI bug that fires on every keystroke —
+# which is what the uncapped endpoints below were exposed to.
+#
+# Limits are set far above human use and far below abuse. Nobody writes 200 replies in an
+# hour; a loop does it in a minute.
+#
+# frappe.in_test skips it, deliberately. The counters live in redis and outlive a test
+# run, so a suite that exercises add_message dozens of times would start failing on its
+# second run for reasons having nothing to do with the code under test. The mechanism is
+# covered directly instead (tests/test_rate_limit.py), including a structural test that
+# these decorators stay attached.
+_RATE_LIMITS = {
+    "message": (200, 3600),      # client-visible replies
+    "note": (200, 3600),         # internal work notes
+    "attachment": (100, 3600),   # 10 MB each, so this also bounds storage per user per hour
+    "invite": (100, 3600),       # each one sends mail; a loop here gets the domain throttled
+}
+
+
+def _rate_limit_key(action: str, user: str) -> str:
+    """Redis key for one user's budget for one action.
+
+    The site is in the key by hand, as in email._ack_key and for the same reason: incr and
+    expire come straight from redis.Redis and act on the RAW key, while frappe's own
+    get_value/set_value prefix the site themselves. Mixing the two families addresses two
+    different keys and neither works.
+    """
+    return f"helpdesk:rl:{frappe.local.site}:{action}:{user}"
+
+
+def _enforce_rate_limit(action: str):
+    """Count one call against the session user's budget, and throw once it is spent."""
+    if frappe.in_test:
+        return
+    limit, seconds = _RATE_LIMITS[action]
+    key = _rate_limit_key(action, frappe.session.user)
+    cache = frappe.cache()
+    count = cache.incr(key)
+    if count == 1:
+        cache.expire(key, seconds)
+    if count > limit:
+        frappe.throw(
+            _("You have made too many requests. Please wait a few minutes and try again."),
+            frappe.RateLimitExceededError,
+        )
+
+
+def rate_limited(action: str):
+    """Decorate a whitelisted endpoint with a per-user budget.
+
+    Goes INSIDE @frappe.whitelist(), matching how frappe applies its own rate_limit to
+    request_password_reset below: whitelist has to register the outermost callable, and
+    functools.wraps keeps the signature frappe introspects to map form fields to arguments.
+    """
+    def decorator(fn):
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            _enforce_rate_limit(action)
+            return fn(*args, **kwargs)
+
+        # An explicit marker, so the wiring can be asserted. The obvious check —
+        # hasattr(fn, "__wrapped__") — proves nothing: frappe.whitelist wraps every
+        # endpoint it registers, so that attribute is present on all of them, decorated or
+        # not, and a test built on it passes just as happily once the decorator falls off.
+        # This also records WHICH budget, so a rename cannot silently repoint an endpoint.
+        wrapper._rate_limit_action = action
+        return wrapper
+
+    return decorator
 
 
 def _require_read(ticket: str):
@@ -141,6 +223,7 @@ def me():
 
 
 @frappe.whitelist(methods=["POST"])
+@rate_limited("message")
 def add_message(ticket: str, body: str, attachments=None, send_email=None):
     """Append a client-visible message. Allowed for the ticket's client POC or staff.
 
@@ -188,6 +271,7 @@ def add_message(ticket: str, body: str, attachments=None, send_email=None):
 
 
 @frappe.whitelist(methods=["POST"])
+@rate_limited("note")
 def add_note(ticket: str, body: str, attachments=None):
     """Append an internal work note. Staff only (never visible to clients)."""
     _require_team()
@@ -443,6 +527,7 @@ def _attach_private_file(ticket_doc, filename, content, on_ticket=False):
 
 
 @frappe.whitelist(methods=["POST"])
+@rate_limited("attachment")
 def upload_attachment(ticket, on_ticket=0):
     """Attach a multipart-uploaded file (form field `file`) to a ticket as a private file,
     after a tenant-scope read check (client → own ticket only; staff → any). Returns
@@ -838,6 +923,7 @@ def request_password_reset(user):
 
 
 @frappe.whitelist(methods=["POST"])
+@rate_limited("invite")
 def invite_poc(poc):
     """Provision (or re-notify) a POC's portal login. Creates a Website User with the
     Support Client role, links it back via POC.user, and emails a set-password / sign-in
@@ -872,6 +958,7 @@ def invite_poc(poc):
 
 
 @frappe.whitelist(methods=["POST"])
+@rate_limited("invite")
 def invite_member(member):
     """Provision (or re-notify) a team member's staff login. Creates a System User with
     the Support Team role, links it via Team Member.user, marks the member Invited and
