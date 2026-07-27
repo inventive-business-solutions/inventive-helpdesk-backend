@@ -827,6 +827,46 @@ def invite_admin(member_name, email, title=None):
 
 
 @frappe.whitelist(methods=["POST"])
+def revoke_account(member):
+    """Take someone out of the system entirely: disable the login and end their sessions.
+
+    Removing a Team Member only deleted the record. The User stayed enabled and kept its
+    roles, so the person could sign back in — landing in the app with no member link, which
+    reads as a broken account rather than a closed one. Deleting the row is the bookkeeping;
+    THIS is the part that actually removes access.
+
+    Sessions are dropped rather than left to expire, because a revocation someone keeps
+    using until their cookie ages out is not a revocation. Their next request 401s and the
+    client's existing auth-loss handling bounces them to /login, where `enabled = 0` gives
+    the "no longer has access" message rather than a credentials hint.
+
+    Owner-only, and never yourself — locking yourself out is not an action worth offering.
+    """
+    _require_owner()
+    row = frappe.db.get_value("Team Member", member, ["name", "member_name", "user"], as_dict=True)
+    if not row:
+        frappe.throw(_("That team member no longer exists"), frappe.DoesNotExistError)
+    if row.user and row.user == frappe.session.user:
+        frappe.throw(_("You cannot remove your own account"))
+    if row.user and _is_owner(row.user):
+        frappe.throw(_("{0} is a Lead Administrator — their account is not removed here").format(row.member_name))
+
+    if not row.user:
+        return {"member": member, "disabled": False, "sessions_cleared": 0}
+
+    user = frappe.get_doc("User", row.user)
+    user.enabled = 0
+    # Strip app roles too: re-enabling later should be a deliberate re-grant, not a
+    # silent restoration of whatever they held when they left.
+    user.roles = [r for r in user.roles if r.role not in {"Support Manager", "Support Team"}]
+    user.save(ignore_permissions=True)
+
+    cleared = frappe.db.count("Sessions", {"user": row.user})
+    frappe.db.delete("Sessions", {"user": row.user})
+    return {"member": member, "disabled": True, "sessions_cleared": cleared}
+
+
+@frappe.whitelist(methods=["POST"])
 def set_member_admin(member, admin):
     """Grant or revoke delegated admin (the Support Manager role) for one team member.
 

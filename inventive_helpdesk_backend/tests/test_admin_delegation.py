@@ -22,6 +22,7 @@ from inventive_helpdesk_backend.api import (
     admin_candidates,
     invite_admin,
     list_admins,
+    revoke_account,
     set_member_admin,
 )
 
@@ -228,3 +229,60 @@ class TestInviteAdmin(IntegrationTestCase):
         with self.assertRaises(frappe.ValidationError):
             invite_admin("No Address", "not-an-email")
         self.assertFalse(frappe.db.exists("Team Member", {"member_name": "No Address"}))
+
+
+class TestRevokeAccount(IntegrationTestCase):
+    """Removing someone from the system, as opposed to demoting them.
+
+    Deleting a Team Member only ever removed the record — the User stayed enabled with its
+    roles, so the person could sign back in and land in the app with no member link. That
+    reads as a broken account rather than a closed one, and it is the difference between
+    bookkeeping and actually revoking access.
+    """
+
+    def setUp(self):
+        frappe.set_user("Administrator")
+        _user(OWNER, ["Support Team", "System Manager"])
+        _user(AGENT, ["Support Team"])
+        self.owner_m = _member("Deleg Owner", OWNER)
+        self.agent_m = _member("Deleg Agent", AGENT)
+        frappe.db.get_value("User", AGENT, "enabled") or frappe.db.set_value("User", AGENT, "enabled", 1)
+        frappe.db.set_value("User", AGENT, "enabled", 1)
+        frappe.db.commit()
+
+    def tearDown(self):
+        frappe.set_user("Administrator")
+        frappe.db.set_value("User", AGENT, "enabled", 1)
+        frappe.db.commit()
+
+    def test_the_login_is_disabled_not_merely_unlinked(self):
+        frappe.set_user(OWNER)
+        out = revoke_account(self.agent_m)
+        self.assertTrue(out["disabled"])
+        self.assertEqual(frappe.db.get_value("User", AGENT, "enabled"), 0)
+
+    def test_app_roles_are_stripped_so_re_enabling_is_a_deliberate_re_grant(self):
+        frappe.set_user(OWNER)
+        revoke_account(self.agent_m)
+        roles = frappe.get_roles(AGENT)
+        self.assertNotIn("Support Team", roles)
+        self.assertNotIn("Support Manager", roles)
+
+    def test_live_sessions_are_ended_rather_than_left_to_expire(self):
+        frappe.db.delete("Sessions", {"user": AGENT})
+        frappe.get_doc({"doctype": "Sessions", "user": AGENT, "sid": "_test_sid_revoke",
+                        "status": "Active"}).insert(ignore_permissions=True) if frappe.db.exists("DocType", "Sessions") else None
+        frappe.set_user(OWNER)
+        revoke_account(self.agent_m)
+        self.assertEqual(frappe.db.count("Sessions", {"user": AGENT}), 0)
+
+    def test_you_cannot_remove_your_own_account(self):
+        frappe.set_user(OWNER)
+        with self.assertRaises(frappe.ValidationError):
+            revoke_account(self.owner_m)
+        self.assertEqual(frappe.db.get_value("User", OWNER, "enabled"), 1)
+
+    def test_only_a_lead_administrator_may_do_it(self):
+        frappe.set_user(AGENT)
+        with self.assertRaises(frappe.PermissionError):
+            revoke_account(self.owner_m)
