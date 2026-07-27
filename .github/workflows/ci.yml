@@ -29,6 +29,28 @@ jobs:
     environment: Production
 
     steps:
+      # BEFORE checkout, deliberately.
+      #
+      # This is a self-hosted runner, so the workspace persists between runs and whatever
+      # the last one left is still there. Any step that bind-mounts it into a container
+      # writes as root — the lint step did exactly that, leaving a root-owned .ruff_cache
+      # behind. actions/checkout wipes the workspace before cloning and runs as `ubuntu`,
+      # so it could not remove that file and aborted:
+      #
+      #     EACCES: permission denied, unlink '.../.ruff_cache/.gitignore'
+      #
+      # Every subsequent run then failed at step one, naming a cache file rather than the
+      # cause — and no fix committed to this workflow could take effect, because checkout
+      # died before reaching it. A root container is the only thing on the runner able to
+      # delete what a root container created, which is why this runs in one.
+      #
+      # `|| true`: a workspace that does not exist yet (a fresh runner, or the very first
+      # run for this repo) is the normal case, not a failure.
+      - name: Clear root-owned leftovers from the workspace
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE:/ws" alpine:3 \
+            sh -c 'rm -rf /ws/.ruff_cache /ws/.pytest_cache /ws/.mypy_cache' || true
+
       - name: Checkout Main Repository
         uses: actions/checkout@v6
 
