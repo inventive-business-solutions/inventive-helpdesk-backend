@@ -271,10 +271,27 @@ jobs:
           docker run -d --name "${NET}-redis" --network "$NET" \
             redis:7-alpine@sha256:b1addbe72465a718643cff9e60a58e6df1841e29d6d7d60c9a85d8d72f08d1a7
 
-          echo "Waiting for MariaDB to accept connections..."
+          # Probed from ANOTHER container on the network, not with `docker exec`.
+          #
+          # `docker exec ... mariadb-admin ping` connects over the DB container's local
+          # socket, and the official entrypoint runs initialization against a temporary
+          # server started with --skip-networking before restarting the real one. So the
+          # socket answers while no TCP listener exists, the probe passes in a few seconds,
+          # and the app container — which connects across the network, like every real
+          # client — gets nothing.
+          #
+          # Seen on 2026-07-27: "MariaDB ready after 3 attempt(s)" at 16:12:27, then
+          # `OperationalError (2002) Can't connect to server ... (115)` five seconds later.
+          # A latent race since this step was written; heavier load on the shared runner
+          # widens the init window and makes it surface.
+          #
+          # This probe uses the same hostname, port and credentials the tests will, so
+          # passing it means the thing the tests need is actually working.
+          echo "Waiting for MariaDB to accept connections over the network..."
           for i in $(seq 1 60); do
-            if docker exec "${NET}-db" mariadb-admin ping -uroot -p"$DB_ROOT_PASSWORD" --silent >/dev/null 2>&1; then
-              echo "MariaDB ready after ${i} attempt(s)."
+            if docker run --rm --network "$NET" mariadb:11.8 \
+                 mariadb-admin ping -h "${NET}-db" -uroot -p"$DB_ROOT_PASSWORD" --silent >/dev/null 2>&1; then
+              echo "MariaDB reachable on the network after ${i} attempt(s)."
               break
             fi
             if [ "$i" -eq 60 ]; then
@@ -371,11 +388,17 @@ jobs:
         run: |
           EXPECTED_SHA="${{ github.sha }}"
           HEALTH_URL="https://${{ vars.SITE_NAME }}/api/method/inventive_helpdesk_backend.health.check"
-          echo "Waiting for container restart..."
-          sleep 60
-
-          MAX_ATTEMPTS=12
-          WAIT_SECONDS=15
+          # Poll from the first second rather than sleeping first. `sleep 60` was a guess at
+          # restart time and is paid in full on every release, even when the stack is back
+          # in half that. A stale reply costs nothing here: the loop compares build_sha, so
+          # the previous container answering is just a retry.
+          #
+          # Same worst-case budget as before (48 x 5s = 240s), spent probing instead of
+          # waiting. Frappe takes longer to come up than the frontend, so the ceiling is
+          # kept generous — it is the fixed floor that was wasteful, not the ceiling.
+          MAX_ATTEMPTS=48
+          WAIT_SECONDS=5
+          echo "Polling for the new build..."
 
           for i in $(seq 1 $MAX_ATTEMPTS); do
             RESPONSE=$(curl -s --max-time 10 "$HEALTH_URL" || true)
