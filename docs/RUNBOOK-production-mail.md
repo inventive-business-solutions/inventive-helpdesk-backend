@@ -124,11 +124,11 @@ Desk → **Email Account** → New.
 | Default Incoming | ✓ |
 | Default Outgoing | ✓ |
 | Always use Account's Email Address as Sender | ✓ |
-| Email Sync Option | `ALL` · Initial Sync Count `100` |
+| Email Sync Option | **`UNSEEN`** — not `ALL`, see below |
 
 Leave **off**: Create Contact, Enable Automatic Linking, Track Email Status, Append To.
 
-Four of those matter and are easy to get wrong:
+Five of those matter and are easy to get wrong:
 
 - **"Authenticate as Service Principal" must be ticked.** This is the one that fails
   silently. `pull()` skips any OAuth account that has neither this flag nor a user token:
@@ -151,6 +151,10 @@ Four of those matter and are easy to get wrong:
 - **Enable Automatic Linking off.** It only governs plus-addressing and recipient-based
   timeline links. Reply threading does not depend on it (verified in the framework source).
 - **An IMAP Folder row is required.** Saving without one fails with an unhelpful error.
+- **Email Sync Option `UNSEEN`, not `ALL`.** `ALL` derives its IMAP watermark from the
+  Communications table, so deleting tickets — clearing test data before go-live, say —
+  permanently deadlocks intake with no error anywhere. Full diagnosis under *"Intake stops
+  dead after tickets are deleted"* below; it cost an afternoon on 2026-07-27.
 
 Save. Frappe validates the connection on save, so a failure here is a real credential
 problem — most often the Secret **ID** pasted instead of the Secret **Value**, which
@@ -298,6 +302,57 @@ Stop at the first failure; each step depends on the one before.
   built-ins are deliberately narrow: they only match addresses that announce they take no
   replies, because a false positive withholds the acknowledgement and the sender hears
   nothing at all.
+
+## Intake stops dead after tickets are deleted — and never restarts
+
+Happened on 2026-07-27 and cost an afternoon. Every health signal stayed green throughout,
+which is the whole reason it is written down.
+
+**Symptom.** Mail arrives in Outlook. Frappe creates no Communication, no ticket, no
+acknowledgement. Nothing appears in Error Log — not once, ever. The scheduler ticks on
+time, workers are up with zero failures, the Email Account is enabled with valid OAuth, and
+`receive()` returns cleanly having fetched nothing.
+
+**Cause.** With `Email Sync Option = ALL`, Frappe derives its IMAP watermark from the
+Communications table, not from the mailbox:
+
+```python
+# email_account.py, build_email_sync_rule()
+max_uid  = get_max_email_uid(self.name)      # MAX(uid) over received Communications
+last_uid = max_uid + int(self.initial_sync_count or 100) if max_uid == 1 else "*"
+return f"UID {max_uid}:{last_uid}"
+
+# get_max_email_uid() with no Communications:
+return 1
+```
+
+Delete the Communications — which is what clearing test tickets before go-live does — and
+`max_uid` falls back to `1`, pinning the search to `UID 1:101`. Once the mailbox has moved
+past UID 101 that window matches nothing, so no Communication is created, so `max_uid`
+stays 1, so the window never moves. **It is a deadlock, not a delay, and it does not
+self-heal.**
+
+**Diagnosis.** These three together are conclusive, and each is one URL in a browser signed
+into Desk:
+
+| Check | Deadlocked reads |
+| --- | --- |
+| `Communication` list | `[]` — and confirm you are System Manager, or the empty list is just a permission filter |
+| `Email Account.uidnext` vs `IMAP Folder.uidnext` | server is far ahead of the folder watermark |
+| `Error Log` | nothing at all, which rules out auth and IMAP failure |
+
+`Email Account.uidnext` is rewritten from the server on every `receive()`, so a large gap
+between it and the folder's value is a direct measure of unfetched mail.
+
+**Fix.** Set **Email Sync Option** to `UNSEEN`. That rule ignores UIDs entirely and fetches
+unread mail, so it cannot depend on a table that someone may empty.
+
+> **Mark the mailbox read first.** Widening the window ingests every unfetched message at
+> once — one ticket and one acknowledgement each. There were ~52 waiting when this was
+> found, and that is exactly what tripped `Helpdesk ack rate limit tripped` on 2026-07-24.
+
+**Do not** fix it by raising `initial_sync_count`. It works, and it leaves the same trap
+armed for the next person who clears test data.
 
 ## The whole site returns 404 after restarting services
 
