@@ -10,8 +10,7 @@
   "client_name",
   "client_code",
   "status",
-  "since",
-  "product"
+  "since"
  ],
  "fields": [
   {
@@ -42,14 +41,6 @@
    "fieldname": "since",
    "fieldtype": "Date",
    "label": "Onboarding Date"
-  },
-  {
-   "fieldname": "product",
-   "fieldtype": "Link",
-   "in_list_view": 1,
-   "label": "Product",
-   "options": "Product",
-   "description": "Superseded by Client Product; retained for one release so the migration can be rolled back."
   }
  ],
  "grid_page_length": 50,

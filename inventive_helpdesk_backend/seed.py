@@ -83,9 +83,18 @@ def run():
 
     # ---- Clients ----
     _upsert("Client", {"client_name": "Thermax"},
-            {"client_name": "Thermax", "client_code": "THX", "product": "EniMAX", "since": "2024-02-01"})
+            {"client_name": "Thermax", "client_code": "THX", "since": "2024-02-01"})
     _upsert("Client", {"client_name": "Praj"},
-            {"client_name": "Praj", "client_code": "PRJ", "product": "EniPRO", "since": "2024-05-01"})
+            {"client_name": "Praj", "client_code": "PRJ", "since": "2024-05-01"})
+
+    # ---- Client products (engagements) ----
+    # These used to be a `product` value on the Client row itself. That field is gone, and
+    # an unknown key in the dict above would have been dropped in silence — leaving seeded
+    # clients running nothing, which is not a shape the app can otherwise produce. No
+    # divisions: the old single field meant "this client runs this product", full stop.
+    for client, product in (("Thermax", "EniMAX"), ("Praj", "EniPRO")):
+        _upsert("Client Product", {"client": client, "product": product},
+                {"client": client, "product": product})
 
     # ---- Divisions ----
     for client, dname, code in [
