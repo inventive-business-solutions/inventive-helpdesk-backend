@@ -1,34 +1,35 @@
-# Runbook — turning on mail in production
+# Runbook — mail in production
 
-Every step here is transcribed from the configuration proven working on the local site, not
-from documentation. Roughly 30 minutes.
-
-> ## Do not start until the code is deployed
+> ## Status: DONE. Production mail is live and receiving real customer email.
 >
-> Verified live at the time of writing:
+> The mailbox is connected, inbound is arriving, and acknowledgements are going out.
+> **Nothing below needs doing.** Every step is kept as a rebuild reference — for a
+> disaster recovery, a second environment, or the 2028 secret rotation.
+>
+> This file previously opened with a "do not start, the build is unsafe" banner citing
+> `build_sha d344460`. That was true the day it was written and stale within days, and it
+> was read later as if it described the present. **Do not trust a status line in this or
+> any other doc here.** Check the running system instead — it answers in one command:
 >
 > ```
-> backend   https://helpdeskfrappe.inventivebizsol.co.in  ->  build_sha d344460
-> frontend  https://helpdesk.inventivebizsol.co.in        ->  version   c114368
+> curl -s https://helpdeskfrappe.inventivebizsol.co.in/api/method/inventive_helpdesk_backend.health.check
+> curl -s https://helpdesk.inventivebizsol.co.in/api/health
 > ```
 >
-> That backend is **13 commits behind `development`**, and its `_queue_mail` calls
-> `frappe.sendmail(recipients, subject, message, now, retry)` — with **no ticket
-> reference at all**.
+> Then prove what that build actually contains, rather than inferring it from its age:
 >
-> Connecting the live mailbox to that build means, on real customer mail:
+> ```
+> git show <build_sha>:inventive_helpdesk_backend/email.py | grep reference_name
+> git log --oneline <build_sha>..HEAD -- inventive_helpdesk_backend/email.py
+> ```
 >
-> | Missing on prod | Consequence the first day |
-> | --- | --- |
-> | reference / Message-ID anchor | **every customer reply opens a duplicate ticket** |
-> | ack rate limit + `X-Auto-Response-Suppress` | an autoresponder can loop unbounded; M365 throttles the domain |
-> | `_clean_body` | replies arrive as tag soup carrying the whole quoted thread |
-> | `_is_bounce` | `MAILER-DAEMON` opens junk tickets; real delivery failures stay invisible |
-> | `sender` classification | no-reply senders are silently dropped, agents see no warning |
-> | attachment re-parenting | emailed files never reach the ticket |
->
-> **Merge `development` → `master` first.** That is the release, and it triggers the deploy.
-> Then confirm `build_sha` has moved before touching any of the steps below.
+> The whole mail series — threading via the durable Communication anchor, the ack rate
+> limit with `X-Auto-Response-Suppress`, `_clean_body`, `_is_bounce`, sender
+> classification, attachment re-parenting, and the priority-based response-time line —
+> has been live since `c89d6e6`.
+
+Every step here is transcribed from configuration proven working on a real mailbox, not
+from documentation. Roughly 30 minutes from scratch.
 
 ---
 
