@@ -371,11 +371,17 @@ jobs:
         run: |
           EXPECTED_SHA="${{ github.sha }}"
           HEALTH_URL="https://${{ vars.SITE_NAME }}/api/method/inventive_helpdesk_backend.health.check"
-          echo "Waiting for container restart..."
-          sleep 60
-
-          MAX_ATTEMPTS=12
-          WAIT_SECONDS=15
+          # Poll from the first second rather than sleeping first. `sleep 60` was a guess at
+          # restart time and is paid in full on every release, even when the stack is back
+          # in half that. A stale reply costs nothing here: the loop compares build_sha, so
+          # the previous container answering is just a retry.
+          #
+          # Same worst-case budget as before (48 x 5s = 240s), spent probing instead of
+          # waiting. Frappe takes longer to come up than the frontend, so the ceiling is
+          # kept generous — it is the fixed floor that was wasteful, not the ceiling.
+          MAX_ATTEMPTS=48
+          WAIT_SECONDS=5
+          echo "Polling for the new build..."
 
           for i in $(seq 1 $MAX_ATTEMPTS); do
             RESPONSE=$(curl -s --max-time 10 "$HEALTH_URL" || true)
