@@ -936,10 +936,15 @@ def update_member(name, member_name=None, title=None, email=None):
 
 # ---- client / POC administration (staff only) -----------------------------
 @frappe.whitelist(methods=["POST"])
-def update_client(name, client_name=None, client_code=None, since=None, status=None, product=None):
+def update_client(name, client_name=None, client_code=None, since=None, status=None):
     """Edit a client, including a rename. `name` (autonamed from client_name) is a
     Link target on Support Ticket, Division and POC, so frappe.rename_doc cascades
-    the new name to every reference. `product` is a Product docname ("" clears it)."""
+    the new name to every reference.
+
+    The `product` parameter is gone with the `Client.product` field it wrote. A client's
+    products are Client Product engagements now — see create/update/delete_client_product.
+    Keeping the writer would have quietly refilled the field that
+    `clear_legacy_client_product` empties."""
     _require_manager()
     doc = frappe.get_doc("Client", name)
     if client_code is not None:
@@ -948,8 +953,6 @@ def update_client(name, client_name=None, client_code=None, since=None, status=N
         doc.since = since or None
     if status:
         doc.status = status
-    if product is not None:
-        doc.product = product or None
     doc.save(ignore_permissions=True)
     new_name = (client_name or "").strip()
     if new_name and new_name != name:
@@ -961,12 +964,57 @@ def update_client(name, client_name=None, client_code=None, since=None, status=N
 @frappe.whitelist(methods=["POST"])
 def update_product(name, product_name=None):
     """Rename a product. Product is autonamed by product_name and is a Link target on
-    Client.product, so rename_doc cascades the new name to every client running it."""
+    Client Product and Support Ticket, so rename_doc cascades the new name to every
+    engagement and every ticket already raised against it."""
     _require_manager()
     new_name = (product_name or "").strip()
     if new_name and new_name != name:
         frappe.rename_doc("Product", name, new_name, force=True)
         name = new_name
+    return name
+
+
+@frappe.whitelist(methods=["POST"])
+def delete_product(name):
+    """Delete a product, naming the real reason when it cannot be.
+
+    Frappe's own link check refuses the delete and reports whichever row it happened to
+    hit first, which is how a product with no visible clients came back "linked with
+    Client Amazon" — the blocker was the hidden legacy `Client.product` field. That field
+    is gone, but the shape of the problem stays: the Products page can only see
+    engagements, while the delete is governed by every Link field pointing at Product.
+
+    So the check lives here, where all of them are visible, and says which one applies:
+
+    - Tickets: permanent. Ticket history is meant to outlive the catalogue entry, so this
+      is a refusal, not a "try again later" — the UI should not offer Delete at all.
+    - Engagements: fixable. Naming the clients turns it into an instruction.
+    """
+    _require_manager()
+    if not frappe.db.exists("Product", name):
+        frappe.throw(_("{0} no longer exists.").format(name), title=_("Product not found"))
+
+    tickets = frappe.db.count("Support Ticket", {"product": name})
+    if tickets:
+        frappe.throw(
+            _(
+                "{0} is on {1} ticket(s) and has to stay for that history to make sense. "
+                "Rename it if it is no longer sold."
+            ).format(name, tickets),
+            title=_("Product is part of ticket history"),
+        )
+
+    engagements = frappe.get_all("Client Product", filters={"product": name}, fields=["client"])
+    clients = sorted({e.client for e in engagements})
+    if clients:
+        frappe.throw(
+            _("{0} is still run by {1}. Remove it from each before deleting.").format(
+                name, ", ".join(clients)
+            ),
+            title=_("Product is still assigned"),
+        )
+
+    frappe.delete_doc("Product", name, ignore_permissions=True)
     return name
 
 
