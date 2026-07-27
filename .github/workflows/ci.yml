@@ -182,12 +182,33 @@ jobs:
           # Keeps the manifest single-platform; provenance attestations add an
           # "unknown/unknown" entry that confuses some registry/pull paths.
           provenance: false
-          # Cache disabled on purpose: the GHA layer cache was reusing the
-          # `bench get-app` layer, so new app commits never made it into the
-          # image (while build_sha.txt still updated, masking the staleness).
-          # A full rebuild is slower but guarantees the latest app code ships.
-          no-cache: true
+          # Cache re-enabled, but ONLY for the layers that are safe to reuse.
+          #
+          # It was disabled because the layer cache reused `bench init`/get-app, so new app
+          # commits never reached the image while build_sha.txt still updated — staleness
+          # with a correct-looking stamp. `no-cache: true` fixed that by rebuilding
+          # everything, which meant re-installing apt packages, Node and Chromium on every
+          # run: ~260s, of which the app fetch is a small fraction.
+          #
+          # frappe_docker declares `ARG CACHE_BUST` immediately before that RUN and
+          # references it as `: "${CACHE_BUST}"` (images/custom/Containerfile), purely so
+          # the value participates in the layer's cache key. Feeding it the commit SHA
+          # invalidates the app layer on every commit while the `base` stage above it — the
+          # expensive one — stays cached.
+          #
+          # Registry-backed rather than the GHA cache: this host runs two agents, and a
+          # registry cache is shared between them and survives a runner restart. mode=max
+          # keeps intermediate layers, which is the point when the base stage is the cost.
+          #
+          # The guarantee does not rest on this reasoning. "Verify the image contains this
+          # commit's app code" below hashes every .py/.json in the app on the workspace and
+          # inside the image and refuses to continue if they differ — so if the app layer
+          # were ever wrongly reused, the build fails loudly instead of shipping stale code.
+          cache-from: type=registry,ref=${{ vars.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ vars.IMAGE_NAME }}:buildcache,mode=max
           build-args: |
+            # Changes every commit, so the app-install layer is never reused. See above.
+            CACHE_BUST=${{ github.sha }}
             FRAPPE_PATH=https://github.com/frappe/frappe
             # Pinned to a tag, not the version-16 branch. On a branch every rebuild
             # picked up whatever the tip happened to be that day, so the framework
