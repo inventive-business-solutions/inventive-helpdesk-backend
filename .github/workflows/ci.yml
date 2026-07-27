@@ -91,21 +91,21 @@ jobs:
           RUFF_VERSION: "0.15.22"
         run: |
           set -euo pipefail
-          # --no-cache and --user together, for one reason each:
+          # --no-cache is the whole fix. ruff writes .ruff_cache into its working
+          # directory, which is the MOUNTED workspace; the container runs as root, so that
+          # directory landed on the runner owned by root and the next actions/checkout —
+          # running as `ubuntu` — could not delete it. Every later build then died at
+          # checkout with EACCES, before reaching a line of our code.
           #
-          # --no-cache: ruff writes .ruff_cache into its working directory, which is the
-          # MOUNTED workspace. The container runs as root, so that directory landed on the
-          # runner owned by root — and the next run's actions/checkout, running as `ubuntu`,
-          # could not delete it. Every subsequent build then failed at checkout with EACCES
-          # before reaching a line of our code. A lint step has no business leaving anything
-          # behind in a workspace it does not own.
+          # Running the container as --user looked like the tidier fix and was not: pip
+          # then cannot write to the system site-packages, silently falls back to a user
+          # install under $HOME/.local/bin, and that is not on PATH — so the step failed
+          # with `ruff: not found`. This is back to the invocation that ran green for
+          # every build before the cache problem, with only the cache turned off.
           #
-          # --user: belt and braces. Even with the cache off, anything ruff or pip might
-          # write is then owned by the runner user rather than root. HOME is redirected
-          # because pip needs somewhere writable and /root is not it under --user.
-          docker run --rm -v "$PWD:/io" -w /io \
-            --user "$(id -u):$(id -g)" -e HOME=/tmp \
-            python:3-slim sh -c "
+          # The pre-checkout cleanup step above is the backstop for anything else a
+          # containerised tool leaves behind.
+          docker run --rm -v "$PWD:/io" -w /io python:3-slim sh -c "
             pip install --quiet --no-cache-dir ruff==${RUFF_VERSION} &&
             ruff check --no-cache --output-format=github inventive_helpdesk_backend
           "
