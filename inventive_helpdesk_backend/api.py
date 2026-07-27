@@ -25,7 +25,7 @@ from frappe.utils import add_days, cint, now_datetime
 from frappe.utils.password import get_password_reset_limit
 
 from inventive_helpdesk_backend.access import assert_user_unclaimed
-from inventive_helpdesk_backend.permissions import MANAGER_ROLES, TEAM_ROLES
+from inventive_helpdesk_backend.permissions import MANAGER_ROLES, OWNER_ROLES, TEAM_ROLES
 
 
 def _is_team(user: str | None = None) -> bool:
@@ -39,6 +39,18 @@ def _is_manager(user: str | None = None) -> bool:
 def _require_team():
     if not _is_team():
         frappe.throw(_("Only support staff can perform this action"), frappe.PermissionError)
+
+
+def _is_owner(user: str | None = None) -> bool:
+    """May this user DELEGATE admin access? Narrower than _is_manager on purpose."""
+    return bool(set(frappe.get_roles(user or frappe.session.user)) & OWNER_ROLES)
+
+
+def _require_owner():
+    if not _is_owner():
+        frappe.throw(
+            _("Only a site owner can grant or revoke admin access"), frappe.PermissionError
+        )
 
 
 def _require_manager():
@@ -177,6 +189,9 @@ def me():
         "role": "admin" if _is_team(user) else "client",
         # Within the staff app, managers manage the org; agents only work tickets.
         "manage": _is_manager(user),
+        # Owners delegate; delegated managers do everything else. Sent so the
+        # sidebar can hide a section the server would refuse anyway.
+        "is_owner": _is_owner(user),
         "csrf_token": get_csrf_token(),
     }
     # Staff identity in Team-Member terms: the frontend uses `member` (the Team Member
@@ -698,6 +713,78 @@ def upload_attachment(ticket, on_ticket=0):
     if len(content) > _MAX_ATTACHMENT_BYTES:
         frappe.throw(_("Attachments must be 10 MB or smaller"))
     return _attach_private_file(doc, upload.filename, content, cint(on_ticket))
+
+
+@frappe.whitelist()
+def list_admins():
+    """Team members and whether each currently holds delegated admin access.
+
+    Owner-only: this is the delegation console, and who holds admin is itself information
+    about how the site is governed.
+    """
+    _require_owner()
+    rows = frappe.get_all(
+        "Team Member",
+        fields=["name", "member_name", "email", "title", "status", "user"],
+        limit_page_length=0,
+        order_by="member_name asc",
+    )
+    for r in rows:
+        # A member with no linked User has no account to hold a role — surfaced so the UI
+        # can say why the toggle is unavailable rather than silently disabling it.
+        r["can_delegate"] = bool(r.get("user"))
+        r["is_admin"] = bool(r.get("user")) and "Support Manager" in frappe.get_roles(r["user"])
+        r["is_owner"] = bool(r.get("user")) and _is_owner(r["user"])
+    return rows
+
+
+@frappe.whitelist(methods=["POST"])
+def set_member_admin(member, admin):
+    """Grant or revoke delegated admin (the Support Manager role) for one team member.
+
+    Owner-only. A delegated admin gets the full manager surface but cannot reach this
+    endpoint, so admin cannot spread on its own — escalation is prevented by who may call
+    this, not by a UI that hides a button.
+
+    Three refusals, each protecting a way of losing access to the site:
+      - your own access, the fastest possible self-lockout;
+      - an owner's, which this tier does not grant and so must not take away;
+      - a member with no linked account, where there is no user to hold the role.
+    """
+    _require_owner()
+    admin = bool(frappe.parse_json(admin) if isinstance(admin, str) else admin)
+
+    row = frappe.db.get_value("Team Member", member, ["name", "member_name", "user"], as_dict=True)
+    if not row:
+        frappe.throw(_("That team member no longer exists"), frappe.DoesNotExistError)
+    if not row.user:
+        frappe.throw(
+            _("{0} has not accepted their invite yet, so there is no account to grant access to").format(
+                row.member_name
+            )
+        )
+    if row.user == frappe.session.user:
+        frappe.throw(_("You cannot change your own admin access"))
+    if _is_owner(row.user):
+        frappe.throw(_("{0} is a site owner — their access is not managed here").format(row.member_name))
+
+    user = frappe.get_doc("User", row.user)
+    has = "Support Manager" in {r.role for r in user.roles}
+    if admin and not has:
+        user.append("roles", {"role": "Support Manager"})
+    elif not admin and has:
+        user.roles = [r for r in user.roles if r.role != "Support Manager"]
+    else:
+        return {"member": member, "is_admin": admin, "changed": False}
+    user.save(ignore_permissions=True)
+
+    # Leaves a trail on the member record: granting someone the run of the org is worth
+    # being able to answer "who did this, and when" about later.
+    frappe.get_doc("Team Member", member).add_comment(
+        "Comment",
+        _("Admin access {0} by {1}").format(_("granted") if admin else _("revoked"), frappe.session.user),
+    )
+    return {"member": member, "is_admin": admin, "changed": True}
 
 
 @frappe.whitelist(methods=["POST"])

@@ -34,9 +34,22 @@ TEAM_ROLES = {"System Manager", "Administrator", "Support Team"}
 # can never be locked out even before "Support Manager" is granted to anyone.
 MANAGER_ROLES = {"Support Manager", "System Manager", "Administrator"}
 
+# Owner tier: who may DELEGATE the manager tier to someone else.
+#
+# Deliberately not a new role. The distinction already existed for a different reason —
+# System Manager/Administrator are unconditionally managers so the site owner can never be
+# locked out — and that is exactly the population entitled to hand out access. A delegated
+# manager therefore gets the full manager surface but cannot promote anyone, which keeps
+# privilege escalation impossible by construction rather than by a check someone can forget.
+OWNER_ROLES = {"System Manager", "Administrator"}
+
 
 def _is_team(user: str) -> bool:
     return bool(set(frappe.get_roles(user)) & TEAM_ROLES)
+
+
+def _is_owner(user: str) -> bool:
+    return bool(set(frappe.get_roles(user)) & OWNER_ROLES)
 
 
 def _is_manager(user: str) -> bool:
