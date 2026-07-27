@@ -49,7 +49,7 @@ def _is_owner(user: str | None = None) -> bool:
 def _require_owner():
     if not _is_owner():
         frappe.throw(
-            _("Only a site owner can grant or revoke admin access"), frappe.PermissionError
+            _("Only a Lead Admin can grant or revoke Administrator access"), frappe.PermissionError
         )
 
 
@@ -764,9 +764,9 @@ def set_member_admin(member, admin):
             )
         )
     if row.user == frappe.session.user:
-        frappe.throw(_("You cannot change your own admin access"))
+        frappe.throw(_("You cannot change your own Administrator access"))
     if _is_owner(row.user):
-        frappe.throw(_("{0} is a site owner — their access is not managed here").format(row.member_name))
+        frappe.throw(_("{0} is a Lead Admin — their access is not managed here").format(row.member_name))
 
     user = frappe.get_doc("User", row.user)
     has = "Support Manager" in {r.role for r in user.roles}
