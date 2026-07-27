@@ -196,16 +196,30 @@ jobs:
           # invalidates the app layer on every commit while the `base` stage above it — the
           # expensive one — stays cached.
           #
-          # Registry-backed rather than the GHA cache: this host runs two agents, and a
-          # registry cache is shared between them and survives a runner restart. mode=max
-          # keeps intermediate layers, which is the point when the base stage is the cost.
+          # NO registry cache. Tried on 2026-07-27 and measured a regression:
           #
-          # The guarantee does not rest on this reasoning. "Verify the image contains this
-          # commit's app code" below hashes every .py/.json in the app on the workspace and
-          # inside the image and refuses to continue if they differ — so if the app layer
-          # were ever wrongly reused, the build fails loudly instead of shipping stale code.
-          cache-from: type=registry,ref=${{ vars.IMAGE_NAME }}:buildcache
-          cache-to: type=registry,ref=${{ vars.IMAGE_NAME }}:buildcache,mode=max
+          #     ~250s   before (no-cache: true, nothing reused)
+          #      305s   with cache-to/from registry, on a real commit
+          #       99s   with cache, RE-RUNNING THE SAME COMMIT  <- not a valid comparison
+          #
+          # The 99s is the trap. A re-run has the same github.sha, so CACHE_BUST is
+          # unchanged and the bench-init layer is cached too — which never happens for a
+          # real commit. Judged on that number the cache looked like a 60% win; on actual
+          # commits it is slower, because bench init (clone frappe, yarn, build assets) is
+          # precisely the layer CACHE_BUST must rebuild, and the base stage it can reuse is
+          # worth less than shipping the layers to and from GHCR costs.
+          #
+          # What IS kept is the runner's LOCAL layer cache — no network, and the frontend
+          # measured local as much faster than registry. `no-cache: true` used to be here
+          # because the local cache reused `bench get-app` and shipped stale app code under
+          # a correct build_sha. CACHE_BUST fixes that at the source: the app layer's key
+          # now changes every commit, so it cannot be reused.
+          #
+          # The guarantee does not rest on that reasoning being right. "Verify the image
+          # contains this commit's app code" below hashes every .py/.json in the app on the
+          # workspace and inside the image and refuses to continue if they differ — so if
+          # the app layer were ever wrongly reused, the build fails loudly rather than
+          # shipping stale code. That check is what makes dropping no-cache safe to try.
           build-args: |
             # Changes every commit, so the app-install layer is never reused. See above.
             CACHE_BUST=${{ github.sha }}
