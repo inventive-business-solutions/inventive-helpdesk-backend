@@ -209,17 +209,20 @@ jobs:
           # precisely the layer CACHE_BUST must rebuild, and the base stage it can reuse is
           # worth less than shipping the layers to and from GHCR costs.
           #
-          # What IS kept is the runner's LOCAL layer cache — no network, and the frontend
-          # measured local as much faster than registry. `no-cache: true` used to be here
-          # because the local cache reused `bench get-app` and shipped stale app code under
-          # a correct build_sha. CACHE_BUST fixes that at the source: the app layer's key
-          # now changes every commit, so it cannot be reused.
+          # Dropping no-cache to fall back on a LOCAL layer cache was then tried, and also
+          # gained nothing: 241s on a new commit, against a 240-272s baseline. The reason
+          # is that setup-buildx-action creates a fresh builder container per run, so there
+          # is no persistent local cache between runs to hit in the first place.
           #
-          # The guarantee does not rest on that reasoning being right. "Verify the image
-          # contains this commit's app code" below hashes every .py/.json in the app on the
-          # workspace and inside the image and refuses to continue if they differ — so if
-          # the app layer were ever wrongly reused, the build fails loudly rather than
-          # shipping stale code. That check is what makes dropping no-cache safe to try.
+          # So the conclusion is that this build is not cacheable in any useful way: the
+          # part that costs the time (bench init — clone frappe, yarn, build assets) is the
+          # part that MUST rebuild on every commit. no-cache: true restored, which is both
+          # the original setting and an honest statement of that.
+          #
+          # Re-measure only on a NEW commit. A re-run keeps the same github.sha, so
+          # CACHE_BUST does not change and the app layer caches too — that produced a 99s
+          # figure that looked like a 60% win and was an artefact.
+          no-cache: true
           build-args: |
             # Changes every commit, so the app-install layer is never reused. See above.
             CACHE_BUST=${{ github.sha }}
