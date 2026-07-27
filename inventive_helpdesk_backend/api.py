@@ -49,7 +49,7 @@ def _is_owner(user: str | None = None) -> bool:
 def _require_owner():
     if not _is_owner():
         frappe.throw(
-            _("Only a Lead Admin can grant or revoke Administrator access"), frappe.PermissionError
+            _("Only a Lead Administrator can grant or revoke Administrator access"), frappe.PermissionError
         )
 
 
@@ -717,10 +717,14 @@ def upload_attachment(ticket, on_ticket=0):
 
 @frappe.whitelist()
 def list_admins():
-    """Team members and whether each currently holds delegated admin access.
+    """Only the members who currently hold admin — Administrators and Lead Administrators.
 
-    Owner-only: this is the delegation console, and who holds admin is itself information
-    about how the site is governed.
+    Not every team member. This is the list of people WITH access, so it should answer
+    "who can manage this org" at a glance; padding it with everyone who cannot turns the
+    answer into something you have to search for. Promoting someone starts from
+    admin_candidates instead.
+
+    Owner-only: who holds admin is itself information about how the site is governed.
     """
     _require_owner()
     rows = frappe.get_all(
@@ -729,13 +733,42 @@ def list_admins():
         limit_page_length=0,
         order_by="member_name asc",
     )
+    out = []
     for r in rows:
-        # A member with no linked User has no account to hold a role — surfaced so the UI
-        # can say why the toggle is unavailable rather than silently disabling it.
-        r["can_delegate"] = bool(r.get("user"))
-        r["is_admin"] = bool(r.get("user")) and "Support Manager" in frappe.get_roles(r["user"])
-        r["is_owner"] = bool(r.get("user")) and _is_owner(r["user"])
-    return rows
+        if not r.get("user"):
+            continue
+        roles = frappe.get_roles(r["user"])
+        r["is_admin"] = "Support Manager" in roles
+        r["is_owner"] = _is_owner(r["user"])
+        r["can_delegate"] = True
+        if r["is_admin"] or r["is_owner"]:
+            out.append(r)
+    return out
+
+
+@frappe.whitelist()
+def admin_candidates():
+    """Members who could be promoted: linked account, not already an admin, not you.
+
+    Exactly the set set_member_admin will accept, derived from the same conditions rather
+    than restated — a picker offering someone the endpoint then refuses is worse than one
+    that is simply shorter.
+    """
+    _require_owner()
+    rows = frappe.get_all(
+        "Team Member",
+        fields=["name", "member_name", "email", "title", "status", "user"],
+        limit_page_length=0,
+        order_by="member_name asc",
+    )
+    return [
+        r
+        for r in rows
+        if r.get("user")
+        and r["user"] != frappe.session.user
+        and not _is_owner(r["user"])
+        and "Support Manager" not in frappe.get_roles(r["user"])
+    ]
 
 
 @frappe.whitelist(methods=["POST"])
@@ -766,7 +799,7 @@ def set_member_admin(member, admin):
     if row.user == frappe.session.user:
         frappe.throw(_("You cannot change your own Administrator access"))
     if _is_owner(row.user):
-        frappe.throw(_("{0} is a Lead Admin — their access is not managed here").format(row.member_name))
+        frappe.throw(_("{0} is a Lead Administrator — their access is not managed here").format(row.member_name))
 
     user = frappe.get_doc("User", row.user)
     has = "Support Manager" in {r.role for r in user.roles}

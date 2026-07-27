@@ -18,7 +18,7 @@ exactly the group entitled to grant access to others.
 import frappe
 from frappe.tests import IntegrationTestCase
 
-from inventive_helpdesk_backend.api import list_admins, set_member_admin
+from inventive_helpdesk_backend.api import admin_candidates, list_admins, set_member_admin
 
 OWNER = "_test.deleg.owner@example.test"
 AGENT = "_test.deleg.agent@example.test"
@@ -137,11 +137,36 @@ class TestAdminDelegation(IntegrationTestCase):
             set_member_admin(name, True)
 
     # ---- the console -----------------------------------------------------
-    def test_list_admins_reports_each_members_tier(self):
+    def test_list_admins_shows_only_people_who_hold_admin(self):
+        """The list answers "who can manage this org". A plain agent is not an answer to
+        that question and padding the list with them makes it one you have to search."""
         frappe.set_user(OWNER)
         set_member_admin(self.deleg_m, True)
         by_email = {r["email"]: r for r in list_admins()}
+        self.assertIn(DELEGATE, by_email)  # delegated admin
+        self.assertIn(OWNER, by_email)  # lead admin
+        self.assertNotIn(AGENT, by_email)  # plain agent — excluded
         self.assertTrue(by_email[DELEGATE]["is_admin"])
         self.assertFalse(by_email[DELEGATE]["is_owner"])
         self.assertTrue(by_email[OWNER]["is_owner"])
-        self.assertFalse(by_email[AGENT]["is_admin"])
+
+    def test_a_revoked_admin_leaves_the_list(self):
+        frappe.set_user(OWNER)
+        set_member_admin(self.deleg_m, True)
+        self.assertIn(DELEGATE, {r["email"] for r in list_admins()})
+        set_member_admin(self.deleg_m, False)
+        self.assertNotIn(DELEGATE, {r["email"] for r in list_admins()})
+
+    def test_candidates_are_exactly_who_can_be_promoted(self):
+        frappe.set_user(OWNER)
+        emails = {r["email"] for r in admin_candidates()}
+        self.assertIn(AGENT, emails)  # promotable
+        self.assertNotIn(OWNER, emails)  # yourself
+        self.assertNotIn("_test.deleg.ni@example.test", emails)  # no linked account
+        set_member_admin(self.deleg_m, True)
+        self.assertNotIn(DELEGATE, {r["email"] for r in admin_candidates()})  # already admin
+
+    def test_candidates_is_owner_only(self):
+        frappe.set_user(AGENT)
+        with self.assertRaises(frappe.PermissionError):
+            admin_candidates()
