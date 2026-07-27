@@ -83,11 +83,21 @@ class TestDeleteProduct(IntegrationTestCase):
 
     def test_product_on_a_ticket_is_refused_and_says_so(self):
         name = _product("_Test DelProd Ticketed")
+        # The fixture has to take the route a real site takes. SupportTicket.validate
+        # refuses a product the client does not run ("Product not in use here"), so the
+        # engagement must exist when the ticket is raised — and removing it afterwards is
+        # exactly how a product ends up with tickets and no engagement: someone unassigns
+        # it from the client and the tickets already raised keep pointing at it. Inserting
+        # the ticket directly is not a shortcut, it is a state the app cannot produce.
+        engagement = frappe.get_doc({
+            "doctype": "Client Product", "client": CLIENT, "product": name,
+        }).insert(ignore_permissions=True)
         frappe.get_doc({
             "doctype": "Support Ticket", "title": "delprod fixture", "description": "x",
             "ticket_type": "Query", "priority": "Low", "status": "New",
             "client": CLIENT, "division": self.division, "product": name,
         }).insert(ignore_permissions=True)
+        frappe.delete_doc("Client Product", engagement.name, ignore_permissions=True)
 
         with self.assertRaises(frappe.ValidationError) as caught:
             delete_product(name)
