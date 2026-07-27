@@ -772,6 +772,61 @@ def admin_candidates():
 
 
 @frappe.whitelist(methods=["POST"])
+def invite_admin(member_name, email, title=None):
+    """Invite someone who is not on the team yet, straight in as an Administrator.
+
+    An administrator is not necessarily an agent: the person running the org may never
+    work a ticket, and making them join a team first is a step that exists only because
+    the data model happens to hang staff logins off Team Member.
+
+    So this composes the pieces rather than inventing new ones — create the Team Member,
+    invite_member provisions the login and mails the set-password link, then the manager
+    role goes on top. Idempotent on the email, so a second attempt re-invites rather than
+    failing on a duplicate.
+    """
+    _require_owner()
+    email = (email or "").strip().lower()
+    member_name = (member_name or "").strip()
+    if not email or "@" not in email:
+        frappe.throw(_("Enter a valid email address"))
+    if not member_name:
+        frappe.throw(_("Enter the person's name"))
+
+    existing = frappe.db.get_value("Team Member", {"email": email}, "name")
+    if existing:
+        member = existing
+    else:
+        member = frappe.get_doc(
+            {
+                "doctype": "Team Member",
+                "member_name": member_name,
+                "email": email,
+                "title": (title or "").strip() or None,
+                "status": "Not Invited",
+            }
+        ).insert(ignore_permissions=True).name
+
+    # Provision only when there is no account yet. invite_member deliberately refuses an
+    # address that already holds Support Manager — it guards against an administrator
+    # being handed out as a directory invite — so calling it on someone this function
+    # already promoted would fail on its own previous success.
+    user = frappe.db.get_value("Team Member", member, "user")
+    result = {"email_sent": False}
+    if not user:
+        result = invite_member(member)
+        user = frappe.db.get_value("Team Member", member, "user")
+    if user and not _is_owner(user):
+        u = frappe.get_doc("User", user)
+        if "Support Manager" not in {r.role for r in u.roles}:
+            u.append("roles", {"role": "Support Manager"})
+            u.save(ignore_permissions=True)
+    frappe.get_doc("Team Member", member).add_comment(
+        "Comment", _("Invited as Administrator by {0}").format(frappe.session.user)
+    )
+    return {"member": member, "email_sent": result.get("email_sent"), "user": user}
+
+
+@frappe.whitelist(methods=["POST"])
 def set_member_admin(member, admin):
     """Grant or revoke delegated admin (the Support Manager role) for one team member.
 

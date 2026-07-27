@@ -18,7 +18,12 @@ exactly the group entitled to grant access to others.
 import frappe
 from frappe.tests import IntegrationTestCase
 
-from inventive_helpdesk_backend.api import admin_candidates, list_admins, set_member_admin
+from inventive_helpdesk_backend.api import (
+    admin_candidates,
+    invite_admin,
+    list_admins,
+    set_member_admin,
+)
 
 OWNER = "_test.deleg.owner@example.test"
 AGENT = "_test.deleg.agent@example.test"
@@ -170,3 +175,56 @@ class TestAdminDelegation(IntegrationTestCase):
         frappe.set_user(AGENT)
         with self.assertRaises(frappe.PermissionError):
             admin_candidates()
+
+
+class TestInviteAdmin(IntegrationTestCase):
+    """Inviting someone straight in as an Administrator.
+
+    An administrator is not necessarily an agent — the person running the org may never
+    work a ticket — so requiring them to join a team first would be a step that exists
+    only because staff logins hang off Team Member.
+    """
+
+    def setUp(self):
+        frappe.set_user("Administrator")
+        _user(OWNER, ["Support Team", "System Manager"])
+        _user(AGENT, ["Support Team"])
+        _member("Deleg Owner", OWNER)
+        frappe.db.commit()
+
+    def tearDown(self):
+        frappe.set_user("Administrator")
+
+    def test_a_brand_new_person_becomes_an_administrator(self):
+        frappe.set_user(OWNER)
+        email = "_test.fresh.admin@example.test"
+        out = invite_admin("Fresh Admin", email)
+        self.assertTrue(out["member"])
+        self.assertIn("Support Manager", frappe.get_roles(out["user"]))
+        # And they show up in the console, which lists only people who hold access.
+        self.assertIn(email, {r["email"] for r in list_admins()})
+
+    def test_inviting_the_same_address_twice_re_invites_rather_than_failing(self):
+        frappe.set_user(OWNER)
+        email = "_test.fresh.twice@example.test"
+        first = invite_admin("Twice Over", email)
+        second = invite_admin("Twice Over", email)
+        self.assertEqual(first["member"], second["member"])
+        # The second call must not re-provision: invite_member refuses an address that
+        # already holds Support Manager, so re-running it would fail on its own success.
+        self.assertTrue(first["email_sent"] or first["user"])
+        self.assertFalse(second["email_sent"])
+        self.assertEqual(
+            frappe.db.count("Team Member", {"email": email}), 1, "must not create a duplicate member"
+        )
+
+    def test_only_a_lead_administrator_may_invite_one(self):
+        frappe.set_user(AGENT)
+        with self.assertRaises(frappe.PermissionError):
+            invite_admin("Sneaky", "_test.fresh.sneaky@example.test")
+
+    def test_a_malformed_address_is_refused_before_anything_is_created(self):
+        frappe.set_user(OWNER)
+        with self.assertRaises(frappe.ValidationError):
+            invite_admin("No Address", "not-an-email")
+        self.assertFalse(frappe.db.exists("Team Member", {"member_name": "No Address"}))
