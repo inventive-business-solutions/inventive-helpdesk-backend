@@ -79,21 +79,24 @@
    "fieldtype": "Link",
    "in_list_view": 1,
    "label": "Client",
-   "options": "Client"
+   "options": "Client",
+   "search_index": 1
   },
   {
    "fieldname": "division",
    "fieldtype": "Link",
    "in_list_view": 1,
    "label": "Division",
-   "options": "Division"
+   "options": "Division",
+   "search_index": 1
   },
   {
    "fieldname": "product",
    "fieldtype": "Link",
    "in_list_view": 1,
    "label": "Product",
-   "options": "Product"
+   "options": "Product",
+   "search_index": 1
   },
   {
    "fieldname": "raised_by",
@@ -104,13 +107,15 @@
    "fieldname": "assignee",
    "fieldtype": "Link",
    "label": "Assigned To",
-   "options": "Team Member"
+   "options": "Team Member",
+   "search_index": 1
   },
   {
    "fieldname": "assignment_group",
    "fieldtype": "Link",
    "label": "Assignment Group",
-   "options": "Assignment Group"
+   "options": "Assignment Group",
+   "search_index": 1
   },
   {
    "fieldname": "sec_sla",
@@ -129,11 +134,12 @@
    "label": "SLA Risk"
   },
   {
-   "description": "When a client message or an internal note was last added. Compared against Ticket Read Receipt.read_on to decide whether this ticket is unread for a given agent. Deliberately NOT bumped by field edits (status, priority, assignment) — those are recorded in the activity log, and marking a ticket unread every time someone re-prioritises it would make the indicator meaningless.",
+   "description": "When a client message or an internal note was last added. Compared against Ticket Read Receipt.read_on to decide whether this ticket is unread for a given agent. Deliberately NOT bumped by field edits (status, priority, assignment) \u2014 those are recorded in the activity log, and marking a ticket unread every time someone re-prioritises it would make the indicator meaningless.",
    "fieldname": "last_activity_on",
    "fieldtype": "Datetime",
    "label": "Last Activity On",
-   "read_only": 1
+   "read_only": 1,
+   "search_index": 1
   },
   {
    "fieldname": "col2",
@@ -211,7 +217,7 @@
    "permlevel": 1
   },
   {
-   "description": "Append-only record of who changed what on this ticket. Written server-side by SupportTicket.before_save (tracked fields) and inventive_helpdesk_backend.api (collaborator events) — never by the client. permlevel 1 keeps it off every client POC response, exactly like the work notes above.",
+   "description": "Append-only record of who changed what on this ticket. Written server-side by SupportTicket.before_save (tracked fields) and inventive_helpdesk_backend.api (collaborator events) \u2014 never by the client. permlevel 1 keeps it off every client POC response, exactly like the work notes above.",
    "fieldname": "activity",
    "fieldtype": "Table",
    "label": "Activity",

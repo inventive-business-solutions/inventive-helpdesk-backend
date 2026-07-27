@@ -15,6 +15,43 @@ events, both after_commit (so a re-fetch triggered by the event reads committed 
 import frappe
 from frappe.realtime import get_doctype_room
 
+#: The columns a list row actually renders (mirrors TICKET_LIST_FIELDS in the frontend
+#: store). A change to anything outside this set cannot alter any open list view, so it
+#: has no business waking every connected session.
+LIST_VISIBLE_FIELDS = (
+    "title",
+    "ticket_type",
+    "priority",
+    "status",
+    "client",
+    "division",
+    "product",
+    "raised_by",
+    "assignee",
+    "assignment_group",
+    "due_date",
+    "sla_risk",
+)
+
+
+def _list_row_changed(doc) -> bool:
+    """Did this save alter anything a list row displays?
+
+    `ticket_list_dirty` is a broadcast: every connected staff and portal session refetches
+    its whole ticket list on receipt. Adding a work note or a client message calls
+    doc.save(), so before this check a single note told the entire organisation to refetch
+    — and a burst of them multiplied by every open tab. Anyone actually *looking* at the
+    ticket still gets the doc-room `ticket_update` below, which is the event that carries
+    the change to where it is visible.
+
+    No previous version means an insert (or a save outside the normal flow), which must
+    always ping: a brand-new ticket is a new row.
+    """
+    before = doc.get_doc_before_save()
+    if before is None:
+        return True
+    return any(doc.get(f) != before.get(f) for f in LIST_VISIBLE_FIELDS)
+
 
 def publish_ticket_update(doc, method=None):
     frappe.publish_realtime(
@@ -24,6 +61,8 @@ def publish_ticket_update(doc, method=None):
         docname=doc.name,
         after_commit=True,
     )
+    if not _list_row_changed(doc):
+        return
     # Pass `room` explicitly: publish_realtime only derives the doctype room for the
     # built-in `list_update` event. For a custom event, doctype-without-docname falls
     # through to the site room ("all"), which Frappe's socket handler joins for System
