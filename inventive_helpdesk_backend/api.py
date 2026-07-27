@@ -1383,6 +1383,11 @@ LINK_INVALID = "invalid"
 def _resolve_password_key(key):
     """(user_doc, status) for a raw key. Never consumes it.
 
+    NOTE for callers: unpack the first value into a NAMED variable, never `_`. In this
+    module `_` is frappe's gettext alias, so `_, status = ...` rebinds the translator to a
+    User document and the next `_("…")` raises `'User' object is not callable`. It cost a
+    red release pipeline to learn.
+
     Not consuming matters more than it looks: corporate mail security (Outlook Safe Links,
     Defender ATP) fetches every URL in a message before the human sees it. If arriving at
     the page burned the key, scanned invites would be dead by the time they were opened,
@@ -1445,7 +1450,7 @@ def password_link_status(key):
     they are high-entropy and single-use. Rate-limited regardless, since this is reachable
     without signing in.
     """
-    _, status = _resolve_password_key(key)
+    _user, status = _resolve_password_key(key)
     return {"status": status, "support_inbox": _support_inbox_address()}
 
 
@@ -1473,7 +1478,7 @@ def set_password_with_key(key, new_password):
     """
     from frappe.core.doctype.user.user import update_password
 
-    _, status = _resolve_password_key(key)
+    _user, status = _resolve_password_key(key)
     if status != LINK_VALID:
         # PermissionError, and no hand-set status code. 410 Gone would describe an expired
         # link better, but frappe.throw derives the response code from the exception type
