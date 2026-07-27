@@ -793,7 +793,18 @@ def send_ticket_ack(doc, method=None):
         _queue_mail(
             recipient,
             subject,
-            _ack_email_html(doc.name, doc.title, _client_cta(doc, "View your ticket")),
+            # Priority as it stands at insert. An emailed-in ticket is untriaged, so it
+            # carries the doctype's own default of Medium and is promised that band — which
+            # is honest: it IS a Medium ticket until someone re-classifies it. Re-triaging
+            # later does not re-send this mail, so the promise made here is the one that
+            # stands; that is an argument for the Medium default being a sane floor, not for
+            # quoting a turnaround nobody has assessed.
+            _ack_email_html(
+                doc.name,
+                doc.title,
+                _client_cta(doc, "View your ticket"),
+                priority=getattr(doc, "priority", None),
+            ),
             "Ticket acknowledgement",
             doc.name,
             log_kind="Acknowledgement",
@@ -925,14 +936,45 @@ def _shell(inner):
     )
 
 
-def _ack_email_html(ticket_name, subject_line, cta):
+#: First-response targets by priority, in business hours, with the phrase shown to the
+#: client. These are a STATED COMMITMENT, not a computed SLA — nothing in this app measures
+#: or enforces them yet (`sla_risk` and `due_date` exist as fields but nothing populates
+#: them). Kept here as the single place the numbers live, so when an SLA engine does arrive
+#: it reads from this table rather than a second one drifting beside it.
+#:
+#: An acknowledgement that only says "we got it" is what produces the "any update?" chaser
+#: two hours later. Saying when someone will reply is the whole value of the mail.
+RESPONSE_TARGETS = {
+    "Critical": "within 4 business hours",
+    "High": "within 1 business day",
+    "Medium": "within 2 business days",
+    "Low": "within 3 business days",
+}
+#: Used when a ticket arrives with no priority set — emailed-in tickets are untriaged until
+#: someone classifies them, and promising a Critical turnaround for mail nobody has read
+#: would be a commitment we did not make.
+DEFAULT_RESPONSE_TARGET = "within 1 business day"
+
+
+def response_target(priority: str | None) -> str:
+    """The first-response phrase for a priority. Unknown or unset falls back deliberately."""
+    return RESPONSE_TARGETS.get((priority or "").strip(), DEFAULT_RESPONSE_TARGET)
+
+
+def _ack_email_html(ticket_name, subject_line, cta, priority=None):
     subj = frappe.utils.escape_html((subject_line or "").strip() or "Your request")
+    target = frappe.utils.escape_html(response_target(priority))
     return _shell(f"""
   <h2 style="font-size:20px;font-weight:700;margin:0 0 6px;">We&#39;ve got your request</h2>
   <p style="font-size:14px;line-height:1.6;color:#464b5c;margin:0 0 18px;">
     Thanks for reaching out to Inventive Helpdesk. Your message has been logged and our support team is on it —
     we&#39;ll follow up with you at this email address.
   </p>
+  <div style="background:#eef0fb;border-left:3px solid #4f46e5;border-radius:6px;padding:12px 16px;margin:0 0 18px;">
+    <div style="font-size:13.5px;line-height:1.6;color:#1e2230;">
+      You can expect a reply from our team <b>{target}</b>.
+    </div>
+  </div>
   <div style="background:#f4f5fb;border:1px solid #e6e8f2;border-radius:10px;padding:14px 16px;margin:0 0 18px;">
     <div style="font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:#8a90a2;font-weight:700;">Your ticket</div>
     <div style="font-size:18px;font-weight:700;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#4f46e5;margin-top:4px;">{ticket_name}</div>
