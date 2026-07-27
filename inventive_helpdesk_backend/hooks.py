@@ -11,9 +11,18 @@ app_email = "helpdesk@inventivebizsol.com"
 app_license = "mit"
 
 # --- Inventive Helpdesk: install/migrate ---
-# Ship the app's roles in code so a fresh site has them before DocPerms load.
-after_install = "inventive_helpdesk_backend.install.ensure_roles"
-after_migrate = "inventive_helpdesk_backend.install.ensure_roles"
+# Ship the app's roles in code so a fresh site has them before DocPerms load, and hold the
+# set-password link lifetime wide enough for an invite (Frappe's default is 20 minutes).
+# Both are idempotent and run on every migrate, so a restored or rebuilt site converges
+# without anyone remembering to set them by hand.
+after_install = [
+    "inventive_helpdesk_backend.install.ensure_roles",
+    "inventive_helpdesk_backend.install.ensure_link_expiry",
+]
+after_migrate = [
+    "inventive_helpdesk_backend.install.ensure_roles",
+    "inventive_helpdesk_backend.install.ensure_link_expiry",
+]
 
 # --- Inventive Helpdesk: tenant isolation ---
 permission_query_conditions = {

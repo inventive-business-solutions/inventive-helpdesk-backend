@@ -19,6 +19,37 @@ ROLES = (
 _STANDARD_USER_TYPES = ("System User", "Website User")
 
 
+def ensure_link_expiry():
+    """Widen Frappe's set-password link lifetime to cover an invite.
+
+    System Settings.reset_password_link_expiry_duration ships at 1200 seconds — twenty
+    minutes. That is a sane default for a password reset and useless for an invite, which is
+    opened whenever the recipient next reads their mail. On this site most invites were
+    therefore dead before anyone clicked them, and the failure looked like a broken invite
+    system rather than a policy.
+
+    Raised to the invite window, never lowered: a site that has deliberately set something
+    longer is left alone. The SHORTER reset window is not expressed here at all — it is
+    enforced per-key in api._resolve_password_key, because Frappe has one setting and the
+    two link types need different answers.
+
+    The residual gap is worth stating plainly: this makes Frappe's OWN update_password
+    accept a reset key for 24h, and anything calling that endpoint directly on the backend
+    host bypasses the tighter check. The app's proxy no longer forwards it, so the frontend
+    origin cannot reach it, but the Frappe host is separately reachable and always has been.
+    Closing that properly means fronting the desk, not another line here.
+    """
+    from inventive_helpdesk_backend.api import INVITE_LINK_TTL_HOURS
+
+    wanted = INVITE_LINK_TTL_HOURS * 60 * 60
+    current = frappe.db.get_single_value("System Settings", "reset_password_link_expiry_duration")
+    if current and int(current) >= wanted:
+        return
+    frappe.db.set_single_value("System Settings", "reset_password_link_expiry_duration", wanted)
+    frappe.clear_cache()
+    frappe.logger().info(f"ensure_link_expiry: reset_password_link_expiry_duration {current} -> {wanted}")
+
+
 def ensure_roles():
     """Create the app's roles, and hold existing ones to the spec above.
 
