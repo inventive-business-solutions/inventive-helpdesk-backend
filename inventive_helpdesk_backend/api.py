@@ -14,13 +14,14 @@ because each one first authorizes explicitly (_require_team / _require_read).
 Any new method added here MUST start with one of those guards.
 """
 import json
+from functools import wraps
 
 import frappe
 from frappe import _
 from frappe.model.rename_doc import rename_doc
 from frappe.rate_limiter import rate_limit
 from frappe.sessions import get_csrf_token
-from frappe.utils import cint, now_datetime
+from frappe.utils import add_days, cint, now_datetime
 from frappe.utils.password import get_password_reset_limit
 
 from inventive_helpdesk_backend.access import assert_user_unclaimed
@@ -73,6 +74,87 @@ def _norm_attachments(attachments) -> str:
     if isinstance(attachments, str):
         return attachments
     return json.dumps(attachments)
+
+
+# ---- per-user rate limits ------------------------------------------------
+# frappe's own @rate_limit is IP-based by default, and that is the wrong axis here. Every
+# agent sits behind one corporate NAT, so an IP limit on a working endpoint is a limit on
+# the whole support team at once: one person pasting a long thread of replies would lock
+# out their colleagues. The alternative the decorator offers, `key=`, reads a form field —
+# which the caller controls and can simply vary, so it bounds an honest client and not an
+# abusive one.
+#
+# So these key on the SESSION USER, which is the thing actually being limited. This is not
+# a defence against a determined attacker with many accounts; it is a bound on one
+# compromised login, a runaway retry loop, or a UI bug that fires on every keystroke —
+# which is what the uncapped endpoints below were exposed to.
+#
+# Limits are set far above human use and far below abuse. Nobody writes 200 replies in an
+# hour; a loop does it in a minute.
+#
+# frappe.in_test skips it, deliberately. The counters live in redis and outlive a test
+# run, so a suite that exercises add_message dozens of times would start failing on its
+# second run for reasons having nothing to do with the code under test. The mechanism is
+# covered directly instead (tests/test_rate_limit.py), including a structural test that
+# these decorators stay attached.
+_RATE_LIMITS = {
+    "message": (200, 3600),      # client-visible replies
+    "note": (200, 3600),         # internal work notes
+    "attachment": (100, 3600),   # 10 MB each, so this also bounds storage per user per hour
+    "invite": (100, 3600),       # each one sends mail; a loop here gets the domain throttled
+}
+
+
+def _rate_limit_key(action: str, user: str) -> str:
+    """Redis key for one user's budget for one action.
+
+    The site is in the key by hand, as in email._ack_key and for the same reason: incr and
+    expire come straight from redis.Redis and act on the RAW key, while frappe's own
+    get_value/set_value prefix the site themselves. Mixing the two families addresses two
+    different keys and neither works.
+    """
+    return f"helpdesk:rl:{frappe.local.site}:{action}:{user}"
+
+
+def _enforce_rate_limit(action: str):
+    """Count one call against the session user's budget, and throw once it is spent."""
+    if frappe.in_test:
+        return
+    limit, seconds = _RATE_LIMITS[action]
+    key = _rate_limit_key(action, frappe.session.user)
+    cache = frappe.cache()
+    count = cache.incr(key)
+    if count == 1:
+        cache.expire(key, seconds)
+    if count > limit:
+        frappe.throw(
+            _("You have made too many requests. Please wait a few minutes and try again."),
+            frappe.RateLimitExceededError,
+        )
+
+
+def rate_limited(action: str):
+    """Decorate a whitelisted endpoint with a per-user budget.
+
+    Goes INSIDE @frappe.whitelist(), matching how frappe applies its own rate_limit to
+    request_password_reset below: whitelist has to register the outermost callable, and
+    functools.wraps keeps the signature frappe introspects to map form fields to arguments.
+    """
+    def decorator(fn):
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            _enforce_rate_limit(action)
+            return fn(*args, **kwargs)
+
+        # An explicit marker, so the wiring can be asserted. The obvious check —
+        # hasattr(fn, "__wrapped__") — proves nothing: frappe.whitelist wraps every
+        # endpoint it registers, so that attribute is present on all of them, decorated or
+        # not, and a test built on it passes just as happily once the decorator falls off.
+        # This also records WHICH budget, so a rename cannot silently repoint an endpoint.
+        wrapper._rate_limit_action = action
+        return wrapper
+
+    return decorator
 
 
 def _require_read(ticket: str):
@@ -141,6 +223,7 @@ def me():
 
 
 @frappe.whitelist(methods=["POST"])
+@rate_limited("message")
 def add_message(ticket: str, body: str, attachments=None, send_email=None):
     """Append a client-visible message. Allowed for the ticket's client POC or staff.
 
@@ -188,6 +271,7 @@ def add_message(ticket: str, body: str, attachments=None, send_email=None):
 
 
 @frappe.whitelist(methods=["POST"])
+@rate_limited("note")
 def add_note(ticket: str, body: str, attachments=None):
     """Append an internal work note. Staff only (never visible to clients)."""
     _require_team()
@@ -243,9 +327,26 @@ def _mark_read(ticket: str, user: str | None = None):
         }).insert(ignore_permissions=True)
 
 
+# The unread sweep is bounded on two axes. It runs on every agent's 30-second poll, so its
+# cost is paid per agent per half-minute for the life of the site, and it was unbounded on
+# both: every ticket ever given a `last_activity_on`, then a second query with all of those
+# names in one IN clause. That is flat at a few hundred tickets and grows without limit.
+#
+# The window is what makes it bounded rather than merely large: an unread marker for
+# something nobody has looked at in three months is not a signal an agent is going to act
+# on, whereas anything recent is. Note it keys on ACTIVITY, not creation — a client
+# replying today to a ticket resolved last year has today's timestamp, so the case that
+# most needs the dot stays inside the window.
+#
+# The limit is a backstop for a site busy enough that even 90 days is a lot, and it is
+# ordered so the truncation drops the oldest of the recent rather than an arbitrary slice.
+_UNREAD_WINDOW_DAYS = 90
+_UNREAD_LIMIT = 500
+
+
 @frappe.whitelist()
 def unread_tickets():
-    """Ticket names with activity this agent hasn't seen. Staff only, and scoped.
+    """Ticket names with activity this agent hasn't seen. Staff only, scoped, and bounded.
 
     `get_list`, not `get_all`: get_all ignores permission_query_conditions, so it would
     report activity on every ticket on the site — including other teams' and other
@@ -253,14 +354,24 @@ def unread_tickets():
     only draws a dot on rows it already fetched through the scoped list, but the endpoint
     is whitelisted and answers a direct REST call too. The agent tier is deliberately
     narrow everywhere else in this file; it has no business being wide here.
+
+    Bounded to the last _UNREAD_WINDOW_DAYS days of activity, most recent first, capped at
+    _UNREAD_LIMIT rows. Activity older than the window stops being reported as unread —
+    a deliberate behaviour change, and the point of the bound.
     """
     _require_team()
     user = frappe.session.user
+    # `>` rather than a separate ["is", "set"]: a NULL last_activity_on fails the
+    # comparison, so this subsumes the old filter instead of stacking with it.
     rows = frappe.get_list(
         "Support Ticket",
-        filters={"last_activity_on": ["is", "set"]},
+        filters={"last_activity_on": [">", add_days(now_datetime(), -_UNREAD_WINDOW_DAYS)]},
         fields=["name", "last_activity_on"],
-        limit_page_length=0,
+        order_by="last_activity_on desc",
+        # `limit`, not `limit_page_length`: the latter is deprecated for removal in v17
+        # (frappe/model/qb_query.py:153) and emits a warning on every call — and this one
+        # runs on every agent's poll, so it would be the loudest source of it on the site.
+        limit=_UNREAD_LIMIT,
     )
     if not rows:
         return []
@@ -283,6 +394,159 @@ def mark_ticket_read(ticket: str):
     _require_read(ticket)
     _mark_read(ticket)
     return ticket
+
+
+# ---- dashboard aggregates -------------------------------------------------
+# Every figure on the dashboard was computed in the browser by filtering the full ticket
+# array — which is why the array had to be the full ticket set in the first place, and why
+# capping that fetch made the figures quietly too small. Counting here removes the reason
+# the browser needed every row.
+#
+# These MUST mirror the frontend's own classification exactly (lib/helpers.ts), or the
+# dashboard and the ticket list disagree about the same word. Kept adjacent and named the
+# same so a change to one is an obvious prompt to change the other.
+_ACTIVE_STATUSES = ("New", "Acknowledged", "In Progress", "Pending Client", "Reopened")
+_RESOLVED_STATUSES = ("Resolved", "Closed")
+# helpers.needsAttention: New, or Pending Client for this long, or an active SLA risk.
+_PENDING_CLIENT_STALE_DAYS = 5
+
+
+def _stat_count(filters) -> int:
+    """One permission-scoped COUNT.
+
+    `get_list`, never `get_all` or db.sql: permission_query_conditions apply to the former
+    only, and an aggregate that ignores them reports OTHER TENANTS' totals — a smaller leak
+    than listing their tickets but the same boundary. Verified against a two-client fixture
+    in tests/test_ticket_stats.py rather than assumed.
+
+    The dict form is required by v16 — a "count(name)" string is rejected outright — and
+    the result key is the rendered SQL, so read the single value rather than name it.
+    """
+    rows = frappe.get_list("Support Ticket", filters=filters, fields=[{"COUNT": "name"}], limit=0)
+    return int(next(iter(rows[0].values()))) if rows else 0
+
+
+def _stat_group(field: str, filters=None) -> dict:
+    """Permission-scoped COUNT grouped by one field. Empty/NULL groups key on ""."""
+    rows = frappe.get_list(
+        "Support Ticket",
+        filters=filters or {},
+        fields=[field, {"COUNT": "name"}],
+        group_by=field,
+        limit=0,
+    )
+    out = {}
+    for row in rows:
+        # The count column is whichever key is not the grouping field; its name is the
+        # rendered SQL ("COUNT(`name`)") and is not worth depending on.
+        count = next(v for k, v in row.items() if k != field)
+        out[row.get(field) or ""] = int(count)
+    return out
+
+
+def _needs_attention_count(active_filter) -> int:
+    """Tickets needing attention, counted without double counting.
+
+    helpers.needsAttention is a disjunction — New, OR Pending Client and stale, OR an SLA
+    risk that is still active — and the three overlap: a New ticket flagged at risk
+    satisfies two of them and is ONE ticket. Frappe's or_filters cannot express a
+    conjunction inside a disjunction anyway, so this counts four disjoint sets instead:
+
+      New  +  (Pending Client & stale)  +  (at risk & neither of those)
+
+    split in two because "neither of those" spans both a status set and a date.
+    """
+    cutoff = add_days(now_datetime(), -_PENDING_CLIENT_STALE_DAYS)
+    # Active statuses that are neither New nor Pending Client — an SLA risk here is only
+    # counted by this term.
+    other_active = [s for s in _ACTIVE_STATUSES if s not in ("New", "Pending Client")]
+    return (
+        _stat_count({"status": "New"})
+        + _stat_count({"status": "Pending Client", "creation": ["<=", cutoff]})
+        + _stat_count({"sla_risk": 1, "status": ["in", other_active]})
+        # A Pending Client ticket NOT yet stale, so not already counted above.
+        + _stat_count({"sla_risk": 1, "status": "Pending Client", "creation": [">", cutoff]})
+    )
+
+
+def _trend(weeks: int) -> list:
+    """Weekly created-vs-resolved buckets, anchored on the most recent ticket.
+
+    Anchored on the latest ticket rather than today, matching the chart this replaces — on
+    a quiet site an empty trailing week reads as an outage rather than a quiet week.
+
+    This one reads rows rather than grouping, because the buckets are seven-day windows
+    from a moving anchor and expressing that as SQL would tie the result to one database's
+    date functions. It is bounded by the window: two columns for the tickets created in it,
+    not every ticket ever.
+    """
+    latest = frappe.get_list(
+        "Support Ticket", fields=["creation"], order_by="creation desc", limit=1
+    )
+    if not latest:
+        return []
+    anchor = latest[0]["creation"]
+    start = add_days(anchor, -(weeks * 7 - 1))
+    rows = frappe.get_list(
+        "Support Ticket",
+        filters={"creation": [">=", start]},
+        fields=["creation", "status"],
+        limit=0,
+    )
+    buckets = []
+    for i in range(weeks - 1, -1, -1):
+        end = add_days(anchor, -i * 7)
+        begin = add_days(end, -6)
+        in_week = [r for r in rows if begin <= r["creation"] <= end]
+        buckets.append({
+            "week": f"{begin.strftime('%b')} {begin.day}",
+            "created": len(in_week),
+            "resolved": sum(1 for r in in_week if r["status"] in _RESOLVED_STATUSES),
+        })
+    return buckets
+
+
+@frappe.whitelist()
+def ticket_stats(trend_weeks=8):
+    """Dashboard figures, counted in the database and scoped to the caller.
+
+    Not staff-gated: every query below goes through get_list, so a portal contact receives
+    the same shape computed over their own divisions only. That is what makes it usable by
+    the portal as well as the two dashboards.
+    """
+    weeks = max(1, min(cint(trend_weeks) or 8, 52))
+    active = {"status": ["in", list(_ACTIVE_STATUSES)]}
+    return {
+        "counts": {
+            "total": _stat_count({}),
+            "active": _stat_count(active),
+            "resolved": _stat_count({"status": ["in", list(_RESOLVED_STATUSES)]}),
+            "needs_attention": _needs_attention_count(active),
+            "sla_risk": _stat_count({**active, "sla_risk": 1}),
+            "email": _stat_count({"source": "Email"}),
+            # Assignment gaps among open tickets: no team at all (where emailed-in tickets
+            # land) vs routed to a team but nobody has claimed it.
+            # Both conditions, matching the frontend. SupportTicket.validate rejects an
+            # assignee without a team, so "no team" should already imply "unassigned" —
+            # but that rule only fires when the assignment changes, so a row predating it
+            # can violate it, and this figure would then count a ticket somebody owns.
+            "to_system": _stat_count(
+                {**active, "assignment_group": ["is", "not set"], "assignee": ["is", "not set"]}
+            ),
+            "to_member": _stat_count(
+                {**active, "assignment_group": ["is", "set"], "assignee": ["is", "not set"]}
+            ),
+        },
+        # Status spans everything — it IS the pipeline. The rest describe open work only,
+        # matching the dashboard's own labels ("Open by priority").
+        "by_status": _stat_group("status"),
+        "by_priority": _stat_group("priority", active),
+        "by_type": _stat_group("ticket_type", active),
+        "by_client": _stat_group("client", active),
+        "by_assignee": _stat_group("assignee", active),
+        "by_team": _stat_group("assignment_group", active),
+        "trend": _trend(weeks),
+    }
 
 
 def _my_member() -> str:
@@ -419,6 +683,7 @@ def _attach_private_file(ticket_doc, filename, content, on_ticket=False):
 
 
 @frappe.whitelist(methods=["POST"])
+@rate_limited("attachment")
 def upload_attachment(ticket, on_ticket=0):
     """Attach a multipart-uploaded file (form field `file`) to a ticket as a private file,
     after a tenant-scope read check (client → own ticket only; staff → any). Returns
@@ -814,6 +1079,7 @@ def request_password_reset(user):
 
 
 @frappe.whitelist(methods=["POST"])
+@rate_limited("invite")
 def invite_poc(poc):
     """Provision (or re-notify) a POC's portal login. Creates a Website User with the
     Support Client role, links it back via POC.user, and emails a set-password / sign-in
@@ -848,6 +1114,7 @@ def invite_poc(poc):
 
 
 @frappe.whitelist(methods=["POST"])
+@rate_limited("invite")
 def invite_member(member):
     """Provision (or re-notify) a team member's staff login. Creates a System User with
     the Support Team role, links it via Team Member.user, marks the member Invited and

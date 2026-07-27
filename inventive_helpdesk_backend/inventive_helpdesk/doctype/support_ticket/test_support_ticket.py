@@ -207,6 +207,71 @@ class TestSupportTicket(IntegrationTestCase):
         with self.assertRaises(frappe.ValidationError):
             make_ticket(division=self.div_a)
 
+    # ---- product (one per ticket, and only one the client actually runs) ----
+    def _engagement(self, client, product, divisions=()):
+        if not frappe.db.exists("Product", product):
+            frappe.get_doc({"doctype": "Product", "product_name": product}).insert(ignore_permissions=True)
+        return frappe.get_doc({
+            "doctype": "Client Product", "client": client, "product": product,
+            "divisions": [{"division": d} for d in divisions],
+        }).insert(ignore_permissions=True)
+
+    def test_product_running_at_the_division_is_accepted(self):
+        self._engagement(self.client_a, "_Test Prod Scoped", [self.div_a])
+        t = make_ticket(client=self.client_a, division=self.div_a, product="_Test Prod Scoped")
+        self.assertEqual(t.product, "_Test Prod Scoped")
+
+    def test_client_wide_product_is_accepted_for_any_division(self):
+        # No division rows on the engagement = the client as a whole, so it covers div_a
+        # without naming it.
+        self._engagement(self.client_a, "_Test Prod Wide")
+        t = make_ticket(client=self.client_a, division=self.div_a, product="_Test Prod Wide")
+        self.assertEqual(t.product, "_Test Prod Wide")
+
+    def test_product_the_client_does_not_run_is_rejected(self):
+        if not frappe.db.exists("Product", "_Test Prod Unused"):
+            frappe.get_doc({"doctype": "Product", "product_name": "_Test Prod Unused"}).insert(
+                ignore_permissions=True
+            )
+        with self.assertRaises(frappe.ValidationError):
+            make_ticket(client=self.client_a, division=self.div_a, product="_Test Prod Unused")
+
+    def test_product_running_only_at_another_division_is_rejected(self):
+        # The client runs it, but not here — the case a client+division-only check misses.
+        other = make_division(self.client_a, "Gamma", "GAM")
+        self._engagement(self.client_a, "_Test Prod Elsewhere", [other])
+        with self.assertRaises(frappe.ValidationError):
+            make_ticket(client=self.client_a, division=self.div_a, product="_Test Prod Elsewhere")
+
+    def test_another_clients_product_is_rejected(self):
+        self._engagement(self.client_b, "_Test Prod Foreign", [self.div_b])
+        with self.assertRaises(frappe.ValidationError):
+            make_ticket(client=self.client_a, division=self.div_a, product="_Test Prod Foreign")
+
+    def test_product_requires_client(self):
+        self._engagement(self.client_a, "_Test Prod NeedsClient", [self.div_a])
+        with self.assertRaises(frappe.ValidationError):
+            make_ticket(product="_Test Prod NeedsClient")
+
+    def test_ticket_without_a_product_still_inserts(self):
+        # The email-intake path: inbound mail cannot know the product, so the field must
+        # stay optional on the doctype. Making it reqd would throw on every intake.
+        t = make_ticket(client=self.client_a, division=self.div_a)
+        self.assertFalse(t.product)
+
+    def test_only_one_product_survives_per_ticket(self):
+        # `product` is a single Link, so a second assignment REPLACES the first — there is
+        # no payload shape that carries two. Pinned so that turning this into a child table
+        # later fails here rather than silently allowing multi-product tickets.
+        self._engagement(self.client_a, "_Test Prod One", [self.div_a])
+        self._engagement(self.client_a, "_Test Prod Two", [self.div_a])
+        t = make_ticket(client=self.client_a, division=self.div_a, product="_Test Prod One")
+        t.product = "_Test Prod Two"
+        t.save(ignore_permissions=True)
+        t.reload()
+        self.assertEqual(t.product, "_Test Prod Two")
+        self.assertIsInstance(t.product, str)
+
     # ---- inbound email intake ----
     def test_email_intake_scopes_to_poc(self):
         t = make_ticket(title="From email", from_email=POC_A_EMAIL, ticket_type=None, priority=None)

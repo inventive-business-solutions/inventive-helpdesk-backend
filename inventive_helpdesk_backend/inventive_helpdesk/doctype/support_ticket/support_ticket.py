@@ -50,6 +50,8 @@ class SupportTicket(Document):
                     _("Division {0} belongs to {1}, not {2}").format(self.division, div_client, self.client)
                 )
 
+        self._validate_product()
+
         # Assignment integrity: a member can only be assigned within a team (assign
         # to a team first, then to a member of it). Enforce only when the assignment
         # actually changes — or on insert — so tickets assigned before this rule stay
@@ -61,6 +63,56 @@ class SupportTicket(Document):
                 frappe.throw(_("Assign the ticket to a team before assigning it to a member."))
 
         self._validate_collaborators()
+
+    def _validate_product(self):
+        """A ticket's product must be one the client actually runs, at this division.
+
+        `product` is a single Link, so "one product per ticket" is a property of the shape,
+        not a rule enforced here — there is no payload that can carry two. What this checks
+        is that the one chosen is *legitimate*: a Client Product engagement covering this
+        division, or one attached to the client as a whole (empty division table).
+
+        Without it a REST caller — including a portal client, who may legitimately set this
+        field and so is not covered by _clamp_client_authored_fields — could tag a ticket
+        with any product in the catalogue, including one belonging to another client.
+
+        Deliberately NOT reqd on the doctype: inbound email cannot know the product, so
+        every intake insert would throw. Requiring it is the UI's job, where there is a
+        person to ask."""
+        if not self.product:
+            return
+        if not self.client:
+            frappe.throw(_("A ticket with a product must also have its client set"))
+
+        engagements = frappe.get_all(
+            "Client Product",
+            filters={"client": self.client, "product": self.product},
+            pluck="name",
+        )
+        if not engagements:
+            frappe.throw(
+                _("{0} does not run {1}").format(self.client, self.product),
+                title=_("Product not in use here"),
+            )
+        if not self.division:
+            # No division to narrow by — any engagement of this product will do.
+            return
+
+        for name in engagements:
+            divisions = frappe.get_all(
+                "Client Product Division",
+                filters={"parent": name, "parenttype": "Client Product"},
+                pluck="division",
+            )
+            # An engagement with no divisions covers the whole client, so it satisfies any
+            # division of it. Otherwise this division must be named explicitly.
+            if not divisions or self.division in divisions:
+                return
+
+        frappe.throw(
+            _("{0} does not run {1} at {2}").format(self.client, self.product, self.division),
+            title=_("Product not in use here"),
+        )
 
     def _validate_collaborators(self):
         """Each collaborator row names exactly one party matching its type, doesn't
