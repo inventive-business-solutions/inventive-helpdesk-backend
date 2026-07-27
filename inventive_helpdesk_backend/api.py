@@ -14,6 +14,7 @@ because each one first authorizes explicitly (_require_team / _require_read).
 Any new method added here MUST start with one of those guards.
 """
 import json
+from datetime import timedelta
 from functools import wraps
 
 import frappe
@@ -859,6 +860,15 @@ def revoke_account(member):
     # Strip app roles too: re-enabling later should be a deliberate re-grant, not a
     # silent restoration of whatever they held when they left.
     user.roles = [r for r in user.roles if r.role not in {"Support Manager", "Support Team"}]
+    # And burn any outstanding invite / reset key. access.py's orphan path already did this
+    # and explained why; THIS path — the deliberate "remove this person" button — did not,
+    # so someone revoked with an unopened invite in their inbox kept a working link to an
+    # account that had just been closed.
+    #
+    # Redundant now that set_password_with_key checks `enabled` at redemption, and kept
+    # anyway: that check is the guarantee, this is the one that means there is no live
+    # credential sitting in a mailbox waiting for the guarantee to be the only thing left.
+    user.reset_password_key = ""
     user.save(ignore_permissions=True)
 
     cleared = frappe.db.count("Sessions", {"user": row.user})
@@ -1339,6 +1349,153 @@ def request_password_reset(user):
         msg=_("If this email is registered with us, we have sent password reset instructions to it. Please check your inbox."),
         title=_("Password Reset"),
     )
+
+
+# ---- set-password links: lifetime, revocation, redemption -------------------
+#
+# Frappe mints ONE kind of key (User.reset_password_key, stored sha256-hashed, single-use)
+# and gives it ONE lifetime, System Settings.reset_password_link_expiry_duration. That is a
+# problem, because the two things we send it for want opposite windows:
+#
+#   * An INVITE is opened whenever the person next reads their mail. A window measured in
+#     minutes means most invites are dead on arrival, and the account it activates holds
+#     nothing yet — 24h is the normal, defensible choice.
+#   * A RESET works against a live account with real data behind it. Every extra hour it
+#     sits in a mailbox is another hour a compromised or shared inbox is a way in. An hour
+#     is generous.
+#
+# So the global is set wide enough for the invite and the tighter reset window is enforced
+# here. Which kind a key is comes from `User.last_password_reset_date`: an account that has
+# never had a password set is being invited, one that has is resetting. No new field, no
+# cache entry that a Redis restart would turn into a wall of dead invite links, and the
+# answer self-corrects — the moment someone sets a password, their next key is a reset.
+INVITE_LINK_TTL_HOURS = 24
+RESET_LINK_TTL_HOURS = 1
+
+# What the client is told about a key. Deliberately coarse: never the address it belongs to,
+# never whether an account exists at that address.
+LINK_VALID = "valid"
+LINK_EXPIRED = "expired"
+LINK_REVOKED = "revoked"
+LINK_INVALID = "invalid"
+
+
+def _resolve_password_key(key):
+    """(user_doc, status) for a raw key. Never consumes it.
+
+    Not consuming matters more than it looks: corporate mail security (Outlook Safe Links,
+    Defender ATP) fetches every URL in a message before the human sees it. If arriving at
+    the page burned the key, scanned invites would be dead by the time they were opened,
+    and the failure would look like the invite system being broken.
+    """
+    # frappe.utils re-exports this via `from frappe.utils.data import *`, but Frappe's own
+    # code imports it from data directly — the star re-export is an implementation detail,
+    # and an `__all__` added upstream would silently take it away.
+    from frappe.utils.data import get_datetime, sha256_hash
+
+    key = (key or "").strip()
+    if not key:
+        return None, LINK_INVALID
+
+    name = frappe.db.get_value("User", {"reset_password_key": sha256_hash(key)}, "name")
+    if not name:
+        # Used, cleared, or never real. One answer for all three — distinguishing them
+        # would say whether a key had ever existed.
+        return None, LINK_INVALID
+
+    user = frappe.get_doc("User", name)
+
+    # THE check this whole section exists for. Frappe's update_password never looks at
+    # `enabled` and calls login_as() on success, so a still-valid key on a disabled account
+    # is a working way back in. Testing it here, at redemption, rather than clearing keys
+    # at each of the several places that can disable someone, is what makes that safe: a
+    # new disable path added later is covered without knowing this code exists.
+    if not user.enabled:
+        return user, LINK_REVOKED
+
+    issued = user.last_reset_password_key_generated_on
+    if not issued:
+        # A key with no issue time cannot be aged, so it cannot be trusted. Fail closed.
+        return user, LINK_EXPIRED
+
+    hours = RESET_LINK_TTL_HOURS if user.last_password_reset_date else INVITE_LINK_TTL_HOURS
+    # get_datetime rather than using the value as-is: the field comes back as a datetime
+    # through the ORM but as a string from some paths, and comparing a str to a datetime
+    # raises rather than returning a wrong answer — which would take the page down instead
+    # of expiring a link.
+    if now_datetime() > get_datetime(issued) + timedelta(hours=hours):
+        return user, LINK_EXPIRED
+
+    return user, LINK_VALID
+
+
+@frappe.whitelist(allow_guest=True, methods=["POST"])
+@rate_limit(limit=30, seconds=60 * 60)
+def password_link_status(key):
+    """Is this set-password link still good? Checked when the page loads, before the form.
+
+    Without this, /set-password renders the whole form, the person chooses a password, types
+    it twice, submits — and only then learns the link died. The answer is knowable on
+    arrival, so it should be given on arrival.
+
+    Returns a coarse status and nothing else: no email address, no name, no indication that
+    an account exists at any particular address. `expired` and `invalid` are distinguished
+    because that is the difference between "ask for a new one" and "check you copied the
+    whole link", and because guessing a key is not a threat worth trading that away for —
+    they are high-entropy and single-use. Rate-limited regardless, since this is reachable
+    without signing in.
+    """
+    _, status = _resolve_password_key(key)
+    return {"status": status, "support_inbox": _support_inbox_address()}
+
+
+def _support_inbox_address():
+    """The address to tell someone to write to when their link is dead. Shared with the
+    email module's sender resolution so the two cannot drift apart."""
+    from inventive_helpdesk_backend.email import _support_inbox
+
+    return _support_inbox()
+
+
+@frappe.whitelist(allow_guest=True, methods=["POST"])
+@rate_limit(limit=20, seconds=60 * 60)
+def set_password_with_key(key, new_password):
+    """Redeem a set-password link. Wraps Frappe's update_password with our own gate.
+
+    The gate has to be here and not only in the UI, because the UI is not a security
+    boundary: the page's pre-flight check is a courtesy to the person, and this is the thing
+    that actually decides. Both call _resolve_password_key, so they cannot disagree.
+
+    Delegates the rest — password strength, the hashing, session creation, clearing the key —
+    rather than reimplementing it. update_password signals failure by setting a 410 and
+    RETURNING a message string instead of raising, so that has to be turned back into a
+    throw or a caller would read "The reset password link has expired" as success.
+    """
+    from frappe.core.doctype.user.user import update_password
+
+    _, status = _resolve_password_key(key)
+    if status != LINK_VALID:
+        # PermissionError, and no hand-set status code. 410 Gone would describe an expired
+        # link better, but frappe.throw derives the response code from the exception type
+        # and overwrites anything set beforehand — writing 410 here would look deliberate
+        # and do nothing. The message carries the distinction; the page has already asked
+        # password_link_status and shown the specific wording before reaching this.
+        frappe.throw(
+            {
+                LINK_EXPIRED: _("This link has expired. Ask your administrator for a new invite."),
+                LINK_REVOKED: _("This account no longer has access. Please contact your administrator."),
+            }.get(status, _("This link has already been used or is not valid.")),
+            frappe.PermissionError,
+        )
+
+    result = update_password(new_password=new_password, key=key)
+    # A string back means it refused. Frappe signals that by setting a 410 and RETURNING the
+    # message rather than raising, so an un-checked caller reads a refusal as success. Our
+    # window is tighter than Frappe's on resets and equal on invites, so in practice this
+    # only fires on a race — the key consumed between our check and its own.
+    if isinstance(result, str):
+        frappe.throw(result, frappe.PermissionError)
+    return {"ok": True}
 
 
 @frappe.whitelist(methods=["POST"])
