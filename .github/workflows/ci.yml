@@ -69,9 +69,23 @@ jobs:
           RUFF_VERSION: "0.15.22"
         run: |
           set -euo pipefail
-          docker run --rm -v "$PWD:/io" -w /io python:3-slim sh -c "
+          # --no-cache and --user together, for one reason each:
+          #
+          # --no-cache: ruff writes .ruff_cache into its working directory, which is the
+          # MOUNTED workspace. The container runs as root, so that directory landed on the
+          # runner owned by root — and the next run's actions/checkout, running as `ubuntu`,
+          # could not delete it. Every subsequent build then failed at checkout with EACCES
+          # before reaching a line of our code. A lint step has no business leaving anything
+          # behind in a workspace it does not own.
+          #
+          # --user: belt and braces. Even with the cache off, anything ruff or pip might
+          # write is then owned by the runner user rather than root. HOME is redirected
+          # because pip needs somewhere writable and /root is not it under --user.
+          docker run --rm -v "$PWD:/io" -w /io \
+            --user "$(id -u):$(id -g)" -e HOME=/tmp \
+            python:3-slim sh -c "
             pip install --quiet --no-cache-dir ruff==${RUFF_VERSION} &&
-            ruff check --output-format=github inventive_helpdesk_backend
+            ruff check --no-cache --output-format=github inventive_helpdesk_backend
           "
 
       - name: Set up Docker Buildx
