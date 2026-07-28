@@ -38,7 +38,7 @@ The centre of the app. Named by a controller (not `autoname` in JSON), see
 | `collaborators` | Table → Ticket Collaborator | looped-in teams/members |
 | `notes` | Table → Work Note | internal, never sent to clients — **permlevel 1** |
 | `activity` | Table → Ticket Activity | status/priority/assignment handovers — **permlevel 1** |
-| `sender_kind` | Select | Registered, Known Contact, Unregistered, No Reply — see [DESIGN-email-reply-workflow.md](DESIGN-email-reply-workflow.md) |
+| `sender_kind` | Select | Registered (POC with a login), Known Contact (matches a POC email, no login), Unregistered (no match — the `INB-` bucket), No Reply (matched a No Reply Rule). Classified in `email.py`; decides whether a reply can be sent and by which channel |
 | `no_reply_reason` | Data | why the address was judged unreachable |
 | `first_response_notified_on` | Datetime | stamps the one-time first-reply email, so it only ever goes once |
 
@@ -257,6 +257,8 @@ rolled back rather than committed.
 | --- | --- | --- |
 | GET | `me` | Role, tenant scope, CSRF token. **GET by design** — it must work before a CSRF token is held, right after login. |
 | GET | `check` | Health + `build_sha`. Guest-callable; used by CI to verify a deploy is running the expected commit. |
+| POST | `password_link_status` | Guest. Reports `valid` / `expired` / `revoked` / `invalid` for a set-password key **without consuming it**, plus the support inbox to contact. Rate-limited 30/hr. |
+| POST | `set_password_with_key` | Guest. Redeems a set-password key, refusing any state but `valid`. Rate-limited 20/hr. |
 
 ---
 
@@ -281,6 +283,44 @@ The branded link requires **`app_url`** in site config. Without it the code fall
 Frappe's generic welcome mail, which points at the Frappe desk rather than the app's
 `/set-password` page.
 
+### Link lifetime and redemption
+
+Frappe has **one** setting for set-password link expiry, and the two link types need
+different answers. An invite is opened whenever the recipient next reads their mail; a
+password reset should be short-lived. So the window is derived per key rather than
+configured:
+
+| Link | Window | Derived from |
+| --- | --- | --- |
+| Invite | `INVITE_LINK_TTL_HOURS` = **24h** | `User.last_password_reset_date` is unset |
+| Reset | `RESET_LINK_TTL_HOURS` = **1h** | `last_password_reset_date` is set |
+
+`install.ensure_link_expiry` raises Frappe's `reset_password_link_expiry_duration` to 24h
+(never lowers it) so the framework does not expire an invite early; the tighter reset
+window is enforced per-key in `api._resolve_password_key`. No new field and no cache
+entry — a Redis restart cannot turn live invites into dead ones.
+
+`_resolve_password_key` returns one of four states, and **`revoked` is the security-relevant
+one**: Frappe's own `update_password` never checks `enabled` and calls `login_as()`, so a
+disabled user holding an old link could otherwise walk back in.
+
+| State | Meaning |
+| --- | --- |
+| `valid` | within window, account enabled |
+| `expired` | past the window for its kind |
+| `revoked` | account disabled — `revoke_account` also clears `reset_password_key` |
+| `invalid` | no such key (keys are stored sha256-hashed and are single-use) |
+
+Two endpoints back this. `password_link_status` is a **pre-flight check that must not
+consume the key** — mail scanners (Outlook Safe Links, Defender ATP) fetch every URL in a
+message before the human clicks it, and a consuming check would burn the link in transit.
+`set_password_with_key` wraps Frappe's `update_password`, refusing anything that is not
+`valid` and converting its string-return failure signal into a real exception.
+
+> The frontend proxy no longer forwards Frappe's raw `update_password`. The Frappe host is
+> separately reachable, though, so that endpoint still honours the 24h framework window for
+> anyone calling it directly — closing that means fronting the desk, not another guard here.
+
 ---
 
 ## Migration patches
@@ -297,7 +337,7 @@ Frappe's generic welcome mail, which points at the Frappe desk rather than the a
 
 ## Tests
 
-28 tests, run with:
+187 tests across 15 modules, run with:
 
 ```bash
 bench --site <site> run-tests --app inventive_helpdesk_backend
@@ -307,7 +347,17 @@ They use `frappe.tests.IntegrationTestCase` (not the deprecated
 `frappe.tests.utils.FrappeTestCase`, which is scheduled for removal in v17). Coverage
 centres on the parts most likely to break silently: per-division autoname sequencing,
 tenant isolation (a client cannot read a foreign ticket, work notes are stripped from
-client reads), and the invite flows.
+client reads), reply threading, the invite flows, and set-password link states.
+
+Two are worth knowing about because they guard against failures nothing else catches:
+
+- `test_translator_not_shadowed.py` walks the AST of every module for a rebinding of `_`.
+  In this app `_` is frappe's translator, and it is also Python's conventional throwaway —
+  `_, status = f()` then makes the next `_("…")` call a document. Ruff and typing are both
+  happy with it; it only fails at runtime, on an error path, in front of a user. That exact
+  line reached a release pipeline once.
+- `test_password_link.py` covers all four link states including `revoked`, which is the one
+  that keeps a disabled account from walking back in through an old invite.
 
 Testing must be enabled on the site first:
 
