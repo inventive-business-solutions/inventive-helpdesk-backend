@@ -25,6 +25,7 @@ The centre of the app. Named by a controller (not `autoname` in JSON), see
 | `status` | Select | New, Acknowledged, In Progress, Pending Client, Resolved, Closed, Reopened |
 | `client` | Link → Client | tenant scope |
 | `division` | Link → Division | tenant scope |
+| `product` | Link → Product | optional; backfilled by `backfill_ticket_product` where the division runs exactly one |
 | `raised_by` | Data | |
 | `assignee` | Link → Team Member | |
 | `assignment_group` | Link → Assignment Group | the owning team |
@@ -128,6 +129,31 @@ fresh site always has them before DocPerms reference them.
 | **Support Manager** | yes | Adds management of clients, divisions, POCs, members, teams, products. Granted on top of Support Team. |
 | **Support Client** | no | Portal only. Sees the tickets of the divisions they hold — a set, not one. An empty set sees nothing. |
 
+`Support Client` carries `desk_access = 0`, and `ensure_roles` re-asserts that on **every**
+migrate rather than only at creation. Frappe auto-creates a missing role with its own
+defaults (`desk_access = 1`) the moment a DocPerm references it, which happens during
+migrate — so a create-only check never applied the intended value. That is not cosmetic:
+desk access makes Frappe classify a portal user as a System User, which carries read
+access to core doctypes, and a client POC could then list every User on the site.
+
+### The three tiers
+
+The roles above are not the whole story — two of the three tiers are **sets** defined in
+`permissions.py`, so that the site owner can never be locked out of their own system:
+
+| Tier | Set | Who | May |
+| --- | --- | --- | --- |
+| Team | `TEAM_ROLES` | Support Team, System Manager, Administrator | work tickets |
+| Manager | `MANAGER_ROLES` | Support Manager + the above two | manage org masters |
+| Owner ("Lead Administrator") | `OWNER_ROLES` | **System Manager, Administrator only** | delegate admin access |
+
+The owner tier is **deliberately not a role**. The distinction already existed for a
+different reason — System Manager and Administrator are unconditionally managers so the
+owner cannot lock themselves out — and that is exactly the population entitled to hand out
+access. A delegated manager therefore gets the full manager surface but cannot promote
+anyone, making privilege escalation impossible by construction rather than by a check
+someone can forget.
+
 ### How isolation is enforced
 
 Two Frappe mechanisms, both wired in `hooks.py` → `permissions.py`:
@@ -152,6 +178,8 @@ Product          -> manager_write_gate
 Client Product   -> manager_write_gate
 Team Member      -> manager_write_gate
 Assignment Group -> manager_write_gate
+No Reply Rule    -> manager_write_gate
+Ticket Read Receipt -> own_read_receipt_gate
 ```
 
 `manager_write_gate` covers **all seven** org masters, not just the tenant-scoped ones.
@@ -178,8 +206,19 @@ what gives agents read access to org masters while reserving writes for managers
 
 `support_ticket.py` → `autoname()`.
 
-- Scoped tickets: `{client_code}-{division_code}-####`
-- Unscoped inbound email: `INB-####`
+Three prefixes, chosen by how much is known about the sender:
+
+| Ticket has | Prefix | Meaning |
+| --- | --- | --- |
+| client **and** division | `{client_code}-{division_code}-####` | fully scoped |
+| client, no division | `{client_code}-####` | known client, division not yet identified |
+| neither | `INB-####` | sender matched no registered contact |
+
+The client-only form exists because everything unscoped once shared `INB-`, which made a
+known client's ticket indistinguishable from an unidentified one and put every such client
+on a single global counter. **`INB-` now means only what its name says**, which makes
+"is this ticket from a stranger?" answerable as `client IS NULL` — the discriminator any
+cleanup or reporting script should use.
 
 The counter comes from Frappe's `tabSeries` via `getseries()`, which uses
 `SELECT ... FOR UPDATE`. That is deliberate: it is atomic under concurrent inserts,
@@ -188,8 +227,15 @@ failed insert rolls the number back too.
 
 `_ensure_series_floor()` handles a prefix's **first** use on a site that already has
 tickets (seeded or backfilled data), setting the counter above the highest existing
-number. Because a later explicit-name insert can still overshoot the counter, the
-autoname also skips forward past collisions rather than failing.
+number. It counts only suffixes that are **entirely digits**: a `LIKE` alone is too loose
+now that a client-only prefix exists, because `MSFT-%` also matches `MSFT-AZU-0001`, and
+seeding a client's counter from its divisions' tickets would make the numbering jump for
+no visible reason.
+
+It returns early when the `tabSeries` row already exists, so it seeds **once** and never
+corrects a counter afterwards — which is why zeroing a counter by hand sticks (see
+[Operating hazards](#resetting-the-ticket-counter)). Because a later explicit-name insert
+can still overshoot, the autoname also skips forward past collisions rather than failing.
 
 ---
 
@@ -201,16 +247,31 @@ All wired in `hooks.py`.
 
 | Trigger | What happens |
 | --- | --- |
-| **Support Ticket** `after_insert` | Acknowledgement email to the client (`email.send_ticket_ack`), plus a realtime list ping so open list/board views show it without waiting for the 30s poll |
-| **Support Ticket** `on_update` | Client emailed on client-facing status changes — Resolved / Pending Client (`email.on_ticket_update`) — plus a realtime nudge to owner, team and collaborators |
+| **Support Ticket** `after_insert` | Acknowledgement email to the client (`email.send_ticket_ack`), plus `realtime.publish_ticket_update` so open list/board views show it without waiting for the 30s poll |
+| **Support Ticket** `on_update` | Client emailed on client-facing status changes — Resolved / Pending Client (`email.on_ticket_update`) — plus `realtime.publish_ticket_update`, nudging owner, team and collaborators |
 | **Communication** `after_insert` | Inbound email becomes a ticket or a reply (`email.on_communication`) |
+| **Communication** `on_update` | Attachments that arrive after the body are moved onto the ticket (`email.on_communication_update`). Without it a file existed only in the desk, on a Communication no agent opens |
+
+### Scheduled jobs
+
+| Cron | Job |
+| --- | --- |
+| `*/2 * * * *` | `frappe.email...email_account.pull` — inbound mail. **This is how tickets arrive**; if it stops, intake stops |
+| `*/5 * * * *` | `email.reconcile_email_log` — mirrors Email Queue outcomes onto Ticket Email Log |
+
+The reconcile job is a poll rather than a hook because Email Queue writes its status with
+`frappe.db.set_value`, which fires no doc events — there is nothing to subscribe to.
+
+> A cron entry is a **ceiling, not a guarantee**: jobs only fire as often as the scheduler
+> ticks. That needs **two** site config keys set, not one — see
+> [RUNBOOK-production-mail.md](RUNBOOK-production-mail.md).
 
 ### Other hooks
 
 | Hook | Target |
 | --- | --- |
 | `on_login` | `api.activate_member_on_login` — flips an invited Team Member to Active on their first real sign-in |
-| `after_install`, `after_migrate` | `install.ensure_roles` |
+| `after_install`, `after_migrate` | `install.ensure_roles`, `install.ensure_link_expiry` — both idempotent, both re-run on every migrate |
 
 ### Realtime
 
@@ -355,8 +416,13 @@ message before the human clicks it, and a consuming check would burn the link in
 | Section | Patch | Purpose |
 | --- | --- | --- |
 | pre_model_sync | `convert_child_timestamps` | Must run before the varchar→DATETIME column sync |
-| post_model_sync | `disable_orphaned_logins` | |
-| post_model_sync | `fix_uninvited_member_status` | |
+| pre_model_sync | `clear_legacy_client_product` | Retires `Client.product`, superseded by the Client Product model. **Must stay pre_model_sync** — the same release drops the DocField, and once it is gone the value is unreachable through the ORM |
+| post_model_sync | `disable_orphaned_logins` | Disables logins whose directory record no longer exists |
+| post_model_sync | `fix_uninvited_member_status` | Corrects Team Members left in the wrong status by the pre-`on_login` activation flow |
+| post_model_sync | `backfill_sender_kind` | `sender_kind` is computed in `before_save`, so tickets predating the field are blank — and blank shows the agent nothing at the moment they need to know whether a reply can be sent |
+| post_model_sync | `report_duplicate_directory_emails` | **Reports only, changes nothing.** Before `access.assert_email_unclaimed`, `Team Member.email` had no uniqueness (the doctype is named by `member_name`), so duplicates could exist |
+| post_model_sync | `backfill_contact_divisions_and_products` | Moves to the divisions-table / Client Product model. Three idempotent backfills, deliberately non-lossy — originals are left in place so a rollback costs nothing |
+| post_model_sync | `backfill_ticket_product` | Tags pre-existing tickets with a product where the division runs exactly one, so there is no guess involved |
 
 ---
 
