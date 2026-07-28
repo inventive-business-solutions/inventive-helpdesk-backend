@@ -318,6 +318,7 @@ is written out. The full call path is
 | Method | Endpoint |
 | --- | --- |
 | POST | `update_client`, `update_member`, `update_product`, `update_poc`, `delete_poc` |
+| POST | `update_group` | Renames a team and/or sets its lead. **Rename first, then the lead** — the doctype is autonamed by `group_name`, so a rename changes the docname the lead write has to address. `lead=None` leaves it alone, `""` clears it. A named lead is added to the team if absent. |
 | POST | `create_contact`, `set_contact_divisions` |
 | POST | `create_client_product`, `update_client_product`, `delete_client_product` |
 | POST | `delete_product` |

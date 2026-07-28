@@ -985,6 +985,45 @@ def update_product(name, product_name=None):
 
 
 @frappe.whitelist(methods=["POST"])
+def update_group(name, group_name=None, lead=None):
+    """Rename a team and/or set its lead, in that order and in one call.
+
+    Order matters and is not interchangeable. Assignment Group is autonamed by
+    `group_name`, so a rename changes the docname every other write has to address — doing
+    the lead first and the rename second would write to a name that no longer exists by the
+    time the caller sees the result. Both in one endpoint also means a failed rename cannot
+    leave a lead applied to a team the caller believes was renamed.
+
+    `rename_doc` cascades: Support Ticket.assignment_group and Ticket Collaborator.team both
+    Link here, so every ticket already routed to this team follows the new name.
+
+    `lead` distinguishes absent from empty. None means "leave it alone"; "" means "clear it".
+    Without that split, any caller omitting the field would silently unset the lead — the
+    Manage dialog always sends it, but a future caller updating only the name should not have
+    to know that.
+
+    A named lead is added to the team if they are not already in it. A team led by someone
+    who is not on it is the state the UI would render as a contradiction, and this is the
+    only place that can prevent it atomically.
+    """
+    _require_manager()
+    new_name = (group_name or "").strip()
+    if new_name and new_name != name:
+        frappe.rename_doc("Assignment Group", name, new_name, force=True)
+        name = new_name
+
+    if lead is not None:
+        doc = frappe.get_doc("Assignment Group", name)
+        lead = (lead or "").strip()
+        doc.lead = lead or None
+        if lead and not any(row.member == lead for row in doc.members):
+            doc.append("members", {"member": lead})
+        doc.save(ignore_permissions=True)
+
+    return name
+
+
+@frappe.whitelist(methods=["POST"])
 def delete_product(name):
     """Delete a product, naming the real reason when it cannot be.
 
