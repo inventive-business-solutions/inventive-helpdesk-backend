@@ -127,7 +127,7 @@ fresh site always has them before DocPerms reference them.
 | --- | --- | --- |
 | **Support Team** | yes | Agents. Work tickets; read-only on org masters. |
 | **Support Manager** | yes | Adds management of clients, divisions, POCs, members, teams, products. Granted on top of Support Team. |
-| **Support Client** | no | Portal only. Sees the tickets of the divisions they hold — a set, not one. An empty set sees nothing. |
+| **Support Client** | no | Portal only. Sees the tickets of the divisions they hold — a set, not one — plus client-level tickets carrying no division. An empty set therefore sees client-level tickets only, never the whole client. |
 
 `Support Client` carries `desk_access = 0`, and `ensure_roles` re-asserts that on **every**
 migrate rather than only at creation. Frappe auto-creates a missing role with its own
@@ -165,7 +165,22 @@ tenant never come back:
 Support Ticket -> permissions.ticket_query
 Client         -> permissions.client_query
 Division       -> permissions.division_query
+Client Product -> permissions.client_product_query
 ```
+
+**A portal contact's ticket scope is `division IN (theirs) OR (division IS NULL AND client
+= theirs)`.** The second half is what makes a client with no divisions work at all — a Lead
+there holds an empty set and could otherwise not see even the tickets they raised. It also
+fixes a case that was broken for everyone: `IN (...)` is never true for NULL, so a
+client-level ticket was invisible to every contact on the client side, its author included.
+
+An empty division set is still **not** a fallback to the whole client: a contact with every
+division toggled off sees client-level tickets only. "Not scoped yet" and "scoped to
+everything" must not be the same state, because that failure looks exactly like working.
+
+**Client Product** follows the same shape: a client-wide engagement (empty divisions table)
+is visible to every contact of that client; a division-scoped one only to a contact holding
+one of its divisions.
 
 **`has_permission`** — per-document checks, for direct access by name:
 
@@ -180,6 +195,7 @@ Team Member      -> manager_write_gate
 Assignment Group -> manager_write_gate
 No Reply Rule    -> manager_write_gate
 Ticket Read Receipt -> own_read_receipt_gate
+Client Product   -> manager_write_gate + client_product_has_permission
 ```
 
 `manager_write_gate` covers **all seven** org masters, not just the tenant-scoped ones.
@@ -429,7 +445,8 @@ message before the human clicks it, and a consuming check would burn the link in
 
 ## Tests
 
-187 tests across 15 modules, run with:
+197 tests across 15 modules in `tests/`, plus 46 more alongside the doctypes they cover —
+243 in total. Run with:
 
 ```bash
 bench --site <site> run-tests --app inventive_helpdesk_backend

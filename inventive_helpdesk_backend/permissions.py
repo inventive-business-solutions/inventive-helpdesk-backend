@@ -174,12 +174,31 @@ def ticket_query(user: str | None = None) -> str:
                   ))
         )"""
     p = _poc(user)
-    if not (p and p.divisions):
-        # No POC record, or a contact with no divisions assigned yet (a Lead before anyone
-        # scopes them). Deny outright — an empty scope must never widen to the whole table.
+    if not p:
+        # Not a portal contact at all. Deny outright — an unrecognised caller must never
+        # widen to the whole table.
         return "1=0"
+    esc_client = frappe.db.escape(p.client)
+    # A ticket carrying NO division belongs to the client as a whole, so every contact of
+    # that client can see it. This is what makes a division-less client work at all: a Lead
+    # at a client with no divisions holds an empty set, and under a divisions-only rule
+    # could not see even the tickets they raised themselves.
+    #
+    # It also fixes a case that was silently broken for everyone: `division IN (...)` is
+    # never true for NULL, so a client-level ticket — an emailed-in one that nobody has
+    # scoped yet, say — was invisible to every contact on the client side, including its
+    # author.
+    client_level = (
+        f"(`tabSupport Ticket`.division IS NULL AND `tabSupport Ticket`.client = {esc_client})"
+    )
+    if not p.divisions:
+        # Deliberately NOT a fallback to the whole client. A contact with every division
+        # toggled off is scoped to nothing, and "not scoped yet" must not be the same state
+        # as "scoped to everything" — that failure would be invisible, because it looks
+        # exactly like working.
+        return client_level
     divs = ", ".join(frappe.db.escape(d) for d in sorted(p.divisions))
-    return f"`tabSupport Ticket`.division IN ({divs})"
+    return f"(`tabSupport Ticket`.division IN ({divs}) OR {client_level})"
 
 
 def ticket_has_permission(doc, ptype: str | None = None, user: str | None = None) -> bool:
@@ -208,7 +227,14 @@ def ticket_has_permission(doc, ptype: str | None = None, user: str | None = None
                 return True
         return False
     p = _poc(user)
-    return bool(p and p.divisions) and doc.get("division") in p.divisions
+    if not p:
+        return False
+    # Mirrors ticket_query exactly — see there for why a division-less ticket is client-level.
+    # These two must agree: the query governs lists, this governs get_doc and every write,
+    # and a contact who can list a ticket but not open it is a worse bug than either.
+    if not doc.get("division"):
+        return doc.get("client") == p.client
+    return doc.get("division") in p.divisions
 
 
 # ---- Client ---------------------------------------------------------------
@@ -247,3 +273,59 @@ def division_has_permission(doc, ptype: str | None = None, user: str | None = No
         return True
     p = _poc(user)
     return bool(p and p.client) and doc.get("client") == p.client
+
+
+# ---- Client Product (engagements) -----------------------------------------
+#
+# What a portal contact may know about the products their client runs. Two rules, and the
+# first is what makes a division-less client work:
+#
+#   - A CLIENT-WIDE engagement (empty divisions table) is visible to every contact of that
+#     client. It is not attached to any division, so there is no narrower answer, and a Lead
+#     with no divisions must still be able to see — and raise against — the products the
+#     company actually runs.
+#   - A DIVISION-SCOPED engagement is visible only to a contact holding one of its divisions.
+#     A contact with every division toggled off therefore sees the client-wide ones and
+#     nothing else, which is exactly the intended shape.
+#
+# Registered in BOTH permission_query_conditions and has_permission. Query conditions cover
+# list and report only; without the has_permission half a direct get_doc by name would walk
+# straight past this and hand over another division's — or another client's — commercial
+# terms. That pairing is the same one ticket_query/ticket_has_permission uses, and the
+# reason it exists.
+_CP_DIV_ROWS = (
+    "SELECT 1 FROM `tabClient Product Division` cpd "
+    "WHERE cpd.parent = `tabClient Product`.name AND cpd.parenttype = 'Client Product'"
+)
+
+
+def client_product_query(user: str | None = None) -> str:
+    user = user or frappe.session.user
+    if _is_team(user):
+        return ""
+    p = _poc(user)
+    if not (p and p.client):
+        return "1=0"
+    scoped = [f"`tabClient Product`.client = {frappe.db.escape(p.client)}"]
+    # EXISTS rather than a join: the division list lives in a child table, and a join would
+    # return one row per matching child, silently multiplying engagements in every list.
+    client_wide = f"NOT EXISTS ({_CP_DIV_ROWS})"
+    if not p.divisions:
+        scoped.append(client_wide)
+    else:
+        divs = ", ".join(frappe.db.escape(d) for d in sorted(p.divisions))
+        scoped.append(f"({client_wide} OR EXISTS ({_CP_DIV_ROWS} AND cpd.division IN ({divs})))")
+    return " AND ".join(scoped)
+
+
+def client_product_has_permission(doc, ptype: str | None = None, user: str | None = None) -> bool:
+    user = user or frappe.session.user
+    if _is_team(user):
+        return True
+    p = _poc(user)
+    if not (p and p.client) or doc.get("client") != p.client:
+        return False
+    rows = [row.division for row in (doc.get("divisions") or []) if row.division]
+    if not rows:
+        return True  # client-wide
+    return any(d in p.divisions for d in rows)

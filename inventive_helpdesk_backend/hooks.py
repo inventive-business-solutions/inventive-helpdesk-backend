@@ -29,6 +29,11 @@ permission_query_conditions = {
     "Support Ticket": "inventive_helpdesk_backend.permissions.ticket_query",
     "Client": "inventive_helpdesk_backend.permissions.client_query",
     "Division": "inventive_helpdesk_backend.permissions.division_query",
+    # Engagements carry commercial terms (dates) and say which divisions run what, so a
+    # portal contact must only ever see the client-wide ones plus those covering a division
+    # they hold. Shipping the DocPerm without this line would let any client read EVERY
+    # engagement in the system, including other clients'.
+    "Client Product": "inventive_helpdesk_backend.permissions.client_product_query",
 }
 has_permission = {
     "Support Ticket": "inventive_helpdesk_backend.permissions.ticket_has_permission",
@@ -49,7 +54,10 @@ has_permission = {
     # withholds create/write/delete from everyone below manager. The whitelisted
     # endpoints call _require_manager, but those are not the enforcement point — an
     # agent reaches the doctype directly through /api/resource/*.
-    "Client Product": "inventive_helpdesk_backend.permissions.manager_write_gate",
+    "Client Product": [
+        "inventive_helpdesk_backend.permissions.manager_write_gate",
+        "inventive_helpdesk_backend.permissions.client_product_has_permission",
+    ],
     "Team Member": "inventive_helpdesk_backend.permissions.manager_write_gate",
     "Assignment Group": "inventive_helpdesk_backend.permissions.manager_write_gate",
     # Second occurrence of the Client Product gap, found by enumerating DocPerms against
