@@ -379,3 +379,99 @@ because it creates users with fixed passwords:
 ```bash
 bench --site helpdesk.localhost execute inventive_helpdesk_backend.seed.run
 ```
+
+---
+
+## Operating hazards
+
+Things that have actually cost time here, and are not deducible from the code. Deployment
+lives in [CICD.md](../CICD.md); mail intake and restore have their own runbooks. This is
+the residue — the traps that sit between them.
+
+### "There is no delete option" almost always means you are not Administrator
+
+Frappe short-circuits the whole permission system for the Administrator account before it
+ever reads a permission row (`frappe/permissions.py:107`), and `get_role_permissions`
+returns `allow_everything()` for it too — which is what the desk uses to decide whether to
+*render* a button. So Administrator can already do anything, on every doctype, regardless
+of what the JSON says.
+
+**"Administrator" is a specific user account, not the System Manager role.** A System
+Manager is an ordinary user and gets exactly the rights in the permission rows. This is the
+usual explanation for a missing button, and the usual wrong fix is to grant the right to a
+role — which hands it to everyone holding that role, permanently.
+
+Editing permissions through the Role Permissions Manager also has a lasting side effect:
+`setup_custom_perms()` copies the shipped rows into `tabCustom DocPerm` and from then on
+**the app's JSON permissions are ignored for that doctype on every migrate.** "Restore
+Original Permissions" on the same page is the undo.
+
+### Ticket Email Log is read-only on purpose
+
+It is the only non-child doctype in the app without a delete permission, and the only
+record that outlives Frappe's 30-day Email Queue purge — so it is the only thing that can
+answer *"did we ever actually tell the customer?"* about anything older than a month.
+Granting Delete to Support Team hands that eraser to every agent, including the one whose
+sent mail is in dispute. Use `bench console` for a one-off instead; it runs as
+Administrator and bypasses the restriction without leaving a permanent hole.
+
+### Never delete a Communication whose ticket still exists
+
+Communication is load-bearing for mail in two independent ways:
+
+1. **Reply threading.** `_anchor_outgoing` writes it precisely so a client's reply still
+   finds its ticket after the Email Queue row is purged at 30 days. It is deliberately
+   absent from `default_log_clearing_doctypes`.
+2. **Inbound de-duplication.** `receive.py:765` `is_exist_in_system()` dedups incoming mail
+   against Communication by `message_id`.
+
+Delete one while its ticket is alive and the next client reply forks into a **brand new
+ticket**. Delete a lot of them and, if the mailbox's `UIDVALIDITY` ever changes, Frappe
+re-syncs the last 100 messages with nothing left to dedup against.
+
+The safe invariant, for any cleanup script: **a Communication is only ever deleted if its
+own ticket is being deleted in the same operation.** Deleting a ticket normally does *not*
+remove its Communications — `clear_references` only nulls `reference_name`, so they survive
+as orphans.
+
+See also the deadlock in [RUNBOOK-production-mail.md](RUNBOOK-production-mail.md): with
+`Email Sync Option = ALL`, an empty Communications table pins the IMAP watermark at
+`UID 1:101` **forever**, silently, with every health signal green.
+
+### Deleting does not mean gone
+
+`delete_doc(force=True)` still archives the full document JSON into `tabDeleted Document`.
+Only `delete_permanently=True` skips that (`frappe/model/delete_doc.py:214`). Desk deletes
+never pass it. So after "deleting" a ticket, its contents are still on the site.
+
+### bench console
+
+- It does **not** autocommit. Nothing persists without an explicit `frappe.db.commit()`.
+  `bench mariadb` does autocommit, which is exactly why this catches people out.
+- IPython mangles pasted multi-line blocks. Paste **one line at a time**, or write a file
+  and run `exec(open(f).read(), {})` with the explicit globals dict.
+- The Portainer web console silently drops large pastes — no error, the text simply never
+  arrives. Keep lines short there.
+
+### Resetting the ticket counter
+
+`tabSeries` has no desk UI. `_ensure_series_floor` seeds a prefix only on its **first** use
+(it returns early when the row already exists), so zeroing an existing row sticks and will
+not be pushed back up. Deleting the row instead makes the next ticket re-seed the floor
+from surviving tickets.
+
+```python
+frappe.db.sql("update `tabSeries` set current = 0 where name = 'INB-'")
+frappe.db.commit()
+```
+
+Verify with `select name, current from \`tabSeries\``, then prove it end to end by mailing
+in from an address that is **not** a registered contact — a known contact is named from a
+different counter, so it does not test what you think it tests.
+
+### Release order when the frontend depends on a new endpoint
+
+Deploy the **backend first** and verify the endpoint answers in production before the
+frontend that calls it goes out. The reverse order ships a UI whose requests 404. On the
+frontend side a new endpoint also needs **three** allowlists updated, not one — the
+`next.config.mjs` rewrites, the `proxy.ts` matcher, and the caller.
