@@ -1068,7 +1068,7 @@ def delete_product(name):
 
 
 @frappe.whitelist(methods=["POST"])
-def update_poc(name, poc_name=None, email=None, phone=None, divisions=None, is_primary=None):
+def update_poc(name, poc_name=None, email=None, phone=None, divisions=None, is_primary=None, is_lead=None):
     """Edit a POC. POC is autonamed by `email`, so a changed email must rename the
     doc — and if the POC already has a portal login, the User is renamed too so the
     sign-in address stays in sync (that link is how me()/permissions scope them).
@@ -1092,6 +1092,12 @@ def update_poc(name, poc_name=None, email=None, phone=None, divisions=None, is_p
         doc.phone = phone or None
     if is_primary is not None:
         doc.is_primary = cint(is_primary)
+    if is_lead is not None:
+        # Promoting on the way to an empty division set. Removing a contact's last division
+        # strips every ticket they can see, so the UI offers "make them a client lead"
+        # instead — which is this flag, and is the difference between a client-level contact
+        # and one nobody has finished setting up.
+        doc.is_lead = cint(is_lead)
     if divisions is not None:
         # Replace wholesale rather than merge: the caller sends the complete set, so a
         # division removed in the UI must actually lose access. Clearing the legacy single
