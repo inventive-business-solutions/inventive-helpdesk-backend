@@ -382,11 +382,13 @@ jobs:
           docker network rm "$NET" >/dev/null 2>&1 || true
           echo "Test containers and network removed."
 
-      # Only now, with the tests green, is the image allowed into the registry — and
-      # only from master. A development run has done its job by this point and stops.
+      # Only now, with the tests green, is the image allowed into the registry — and only
+      # from development, which is what production runs. master is promoted AFTER a build
+      # has proven itself live, so it publishes nothing: pushing from both would race two
+      # pipelines onto the same :latest tag for the same commit.
       - name: Push image to registry
         id: push
-        if: success() && github.ref == 'refs/heads/master'
+        if: success() && github.ref == 'refs/heads/development'
         run: |
           set -euo pipefail
           docker push "${{ vars.IMAGE_NAME }}:${{ github.sha }}"
