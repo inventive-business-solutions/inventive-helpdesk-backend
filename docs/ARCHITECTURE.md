@@ -66,7 +66,7 @@ and the backend rejects a member with no team — so writes go through `setAssig
 | **Product** | `product_name` | — |
 | **Client Product** | hash | client, product, dev_start, expected_completion, divisions (child table) |
 | **Team Member** | `member_name` | email, title, status (Not Invited/Invited/Active), user |
-| **Assignment Group** | `group_name` | members (child table) |
+| **Assignment Group** | `group_name` | members (child table), `lead` → Team Member (optional) |
 
 **A POC's scope is `divisions`, the child table — not `division`.** A contact holds a
 SET: one for a division POC, several for a client Lead. `permissions._poc` reads only the
