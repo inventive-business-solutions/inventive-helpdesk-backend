@@ -232,9 +232,13 @@ System Users join — meaning portal users would never receive it.
 
 ## HTTP API
 
-18 whitelisted endpoints. Every mutating one is `methods=["POST"]`: without it Frappe
-defaults to allowing GET, which both skips CSRF validation and causes the write to be
-rolled back rather than committed.
+Every mutating endpoint is `methods=["POST"]`: without it Frappe defaults to allowing GET,
+which both skips CSRF validation and causes the write to be rolled back rather than
+committed.
+
+Endpoint names below are relative to **`inventive_helpdesk_backend.api`** unless a module
+is written out. The full call path is
+`/api/method/inventive_helpdesk_backend.api.<name>`.
 
 ### Tickets
 | Method | Endpoint | Purpose |
@@ -245,18 +249,39 @@ rolled back rather than committed.
 | POST | `claim_ticket` | Agent self-assigns from their team's queue. |
 | POST | `add_collaborator` / `remove_collaborator` | Loop a team or member onto a ticket. |
 | POST | `upload_attachment` | Multipart upload, stored as a private file scoped to the ticket. |
+| POST | `mark_ticket_read` | Stamps a Ticket Read Receipt for the caller. |
+| GET | `unread_tickets` | Unread count for the caller — drives the sidebar badge. |
+| GET | `ticket_stats` | Dashboard aggregates, scoped to what the caller may see. |
 
 ### Org management (manager-gated)
 | Method | Endpoint |
 | --- | --- |
 | POST | `update_client`, `update_member`, `update_product`, `update_poc`, `delete_poc` |
+| POST | `create_contact`, `set_contact_divisions` |
+| POST | `create_client_product`, `update_client_product`, `delete_client_product` |
+| POST | `delete_product` |
 | POST | `invite_poc`, `invite_member` |
+
+### Admin delegation (owner-gated)
+
+Guarded by `_require_owner`, **not** `_require_manager` — a delegated Support Manager holds
+the full manager surface but cannot promote anyone. That keeps privilege escalation
+impossible by construction rather than by a check someone can forget.
+
+| Method | Endpoint | Purpose |
+| --- | --- | --- |
+| GET | `list_admins` | Current Lead Administrators and delegated admins. |
+| GET | `admin_candidates` | Team Members eligible for promotion. |
+| POST | `invite_admin` | Provision an admin directly, without a Team Member record first. |
+| POST | `set_member_admin` | Grant or revoke `Support Manager` for one member. |
+| POST | `revoke_account` | Disable a login — **also clears `reset_password_key`**, so an outstanding invite cannot let them back in. |
 
 ### Session and infrastructure
 | Method | Endpoint | Notes |
 | --- | --- | --- |
 | GET | `me` | Role, tenant scope, CSRF token. **GET by design** — it must work before a CSRF token is held, right after login. |
-| GET | `check` | Health + `build_sha`. Guest-callable; used by CI to verify a deploy is running the expected commit. |
+| GET | **`health.check`** | Health + `build_sha`. Guest-callable; used by CI to verify a deploy is running the expected commit. Lives in `health.py`, **not** `api.py` — `api.check` does not exist and returns a 500 that reads like the site is broken. |
+| POST | `request_password_reset` | Guest. Issues a reset key and mails the branded link. Rate-limited. |
 | POST | `password_link_status` | Guest. Reports `valid` / `expired` / `revoked` / `invalid` for a set-password key **without consuming it**, plus the support inbox to contact. Rate-limited 30/hr. |
 | POST | `set_password_with_key` | Guest. Redeems a set-password key, refusing any state but `valid`. Rate-limited 20/hr. |
 
