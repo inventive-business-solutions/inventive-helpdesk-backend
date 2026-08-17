@@ -24,12 +24,10 @@ Both resolve to `43.242.225.160`. Traefik routes by Host header and issues TLS v
 ## Architecture
 
 **Branch flow:** day-to-day work is committed to `development`. Releases are made by
-pushing to `development`, which is the branch the hosted environment tracks. `master` is
-promoted afterwards to record which build proved itself in production — it publishes and
-deploys nothing.
+merging `development` → `master`, which is the branch the hosted environment tracks.
 
 ```
-push to development          (release)
+merge development -> master  (release)
        │
        ▼
 GitHub Actions (self-hosted, inventive-microscan)
@@ -118,14 +116,11 @@ for why this has to happen *after* the rollout rather than during it.
 
 Generate `APPS_JSON_BASE64` with a **classic** PAT scoped to `repo` only
 (fine-grained PATs are per-repo and `GITHUB_TOKEN` does not work inside BuildKit for
-private repos). **The `branch` here is the branch the IMAGE IS BUILT FROM** — it is what
-the Frappe build clones, and it is independent of which branch the workflow runs on. It
-must be `development`, or a pipeline triggered by development would faithfully build and
-deploy master's code while reporting success:
+private repos). The `branch` here must match the environment — `master` for Production:
 
 ```bash
 # Production (the hosted branch)
-echo -n '[{"url":"https://<PAT>@github.com/inventive-business-solutions/inventive-helpdesk-backend.git","branch":"development"}]' | base64 -w 0
+echo -n '[{"url":"https://<PAT>@github.com/inventive-business-solutions/inventive-helpdesk-backend.git","branch":"master"}]' | base64 -w 0
 
 # Development
 echo -n '[{"url":"https://<PAT>@github.com/inventive-business-solutions/inventive-helpdesk-backend.git","branch":"development"}]' | base64 -w 0
@@ -133,7 +128,7 @@ echo -n '[{"url":"https://<PAT>@github.com/inventive-business-solutions/inventiv
 
 ### Setup commands
 
-The hosted environment is **Production** (branch `development`):
+The hosted environment is **Production** (branch `master`):
 
 ```bash
 REPO=inventive-business-solutions/inventive-helpdesk-backend
@@ -145,10 +140,10 @@ gh variable set IMAGE_NAME --repo $REPO --env Production \
 gh variable set SITE_NAME  --repo $REPO --env Production \
   --body "helpdeskfrappe.inventivebizsol.co.in"
 
-gh secret set APPS_JSON_BASE64      --repo $REPO --env Production --body "<base64-development-value>"
+gh secret set APPS_JSON_BASE64      --repo $REPO --env Production --body "<base64-master-value>"
 ```
 
-Add a second environment later if you want a staging stack tracking another branch;
+Add the Development environment later if you want a second stack tracking `development`;
 it needs its own Portainer stack, domain and `SITE_NAME`.
 
 ---
@@ -158,7 +153,7 @@ it needs its own Portainer stack, domain and `SITE_NAME`.
 1. **Stacks → Add Stack → Repository**
 2. Repository URL: `https://github.com/inventive-business-solutions/inventive-helpdesk-backend`
 3. Authentication: ON (GitHub username + PAT)
-4. Repository reference: `refs/heads/development` — this is the hosted branch
+4. Repository reference: `refs/heads/master` — this is the hosted branch
 5. Compose path: `deploy/docker-compose.yml`
 6. GitOps updates: **OFF** (webhooks are Business Edition; see above)
 7. Add environment variables from `deploy/.env.example` — note `SITES` **includes backticks** in its value
