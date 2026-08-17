@@ -70,6 +70,10 @@
    "role": "Support Team",
    "share": 1,
    "write": 1
+  },
+  {
+   "read": 1,
+   "role": "Support Client"
   }
  ],
  "row_format": "Dynamic",

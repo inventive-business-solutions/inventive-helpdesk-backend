@@ -25,6 +25,7 @@ The centre of the app. Named by a controller (not `autoname` in JSON), see
 | `status` | Select | New, Acknowledged, In Progress, Pending Client, Resolved, Closed, Reopened |
 | `client` | Link → Client | tenant scope |
 | `division` | Link → Division | tenant scope |
+| `product` | Link → Product | optional; backfilled by `backfill_ticket_product` where the division runs exactly one |
 | `raised_by` | Data | |
 | `assignee` | Link → Team Member | |
 | `assignment_group` | Link → Assignment Group | the owning team |
@@ -38,7 +39,7 @@ The centre of the app. Named by a controller (not `autoname` in JSON), see
 | `collaborators` | Table → Ticket Collaborator | looped-in teams/members |
 | `notes` | Table → Work Note | internal, never sent to clients — **permlevel 1** |
 | `activity` | Table → Ticket Activity | status/priority/assignment handovers — **permlevel 1** |
-| `sender_kind` | Select | Registered, Known Contact, Unregistered, No Reply — see [DESIGN-email-reply-workflow.md](DESIGN-email-reply-workflow.md) |
+| `sender_kind` | Select | Registered (POC with a login), Known Contact (matches a POC email, no login), Unregistered (no match — the `INB-` bucket), No Reply (matched a No Reply Rule). Classified in `email.py`; decides whether a reply can be sent and by which channel |
 | `no_reply_reason` | Data | why the address was judged unreachable |
 | `first_response_notified_on` | Datetime | stamps the one-time first-reply email, so it only ever goes once |
 
@@ -65,7 +66,7 @@ and the backend rejects a member with no team — so writes go through `setAssig
 | **Product** | `product_name` | — |
 | **Client Product** | hash | client, product, dev_start, expected_completion, divisions (child table) |
 | **Team Member** | `member_name` | email, title, status (Not Invited/Invited/Active), user |
-| **Assignment Group** | `group_name` | members (child table) |
+| **Assignment Group** | `group_name` | members (child table), `lead` → Team Member (optional) |
 
 **A POC's scope is `divisions`, the child table — not `division`.** A contact holds a
 SET: one for a division POC, several for a client Lead. `permissions._poc` reads only the
@@ -126,7 +127,32 @@ fresh site always has them before DocPerms reference them.
 | --- | --- | --- |
 | **Support Team** | yes | Agents. Work tickets; read-only on org masters. |
 | **Support Manager** | yes | Adds management of clients, divisions, POCs, members, teams, products. Granted on top of Support Team. |
-| **Support Client** | no | Portal only. Sees the tickets of the divisions they hold — a set, not one. An empty set sees nothing. |
+| **Support Client** | no | Portal only. Sees the tickets of the divisions they hold — a set, not one — plus client-level tickets carrying no division. An empty set therefore sees client-level tickets only, never the whole client. |
+
+`Support Client` carries `desk_access = 0`, and `ensure_roles` re-asserts that on **every**
+migrate rather than only at creation. Frappe auto-creates a missing role with its own
+defaults (`desk_access = 1`) the moment a DocPerm references it, which happens during
+migrate — so a create-only check never applied the intended value. That is not cosmetic:
+desk access makes Frappe classify a portal user as a System User, which carries read
+access to core doctypes, and a client POC could then list every User on the site.
+
+### The three tiers
+
+The roles above are not the whole story — two of the three tiers are **sets** defined in
+`permissions.py`, so that the site owner can never be locked out of their own system:
+
+| Tier | Set | Who | May |
+| --- | --- | --- | --- |
+| Team | `TEAM_ROLES` | Support Team, System Manager, Administrator | work tickets |
+| Manager | `MANAGER_ROLES` | Support Manager + the above two | manage org masters |
+| Owner ("Lead Administrator") | `OWNER_ROLES` | **System Manager, Administrator only** | delegate admin access |
+
+The owner tier is **deliberately not a role**. The distinction already existed for a
+different reason — System Manager and Administrator are unconditionally managers so the
+owner cannot lock themselves out — and that is exactly the population entitled to hand out
+access. A delegated manager therefore gets the full manager surface but cannot promote
+anyone, making privilege escalation impossible by construction rather than by a check
+someone can forget.
 
 ### How isolation is enforced
 
@@ -139,7 +165,22 @@ tenant never come back:
 Support Ticket -> permissions.ticket_query
 Client         -> permissions.client_query
 Division       -> permissions.division_query
+Client Product -> permissions.client_product_query
 ```
+
+**A portal contact's ticket scope is `division IN (theirs) OR (division IS NULL AND client
+= theirs)`.** The second half is what makes a client with no divisions work at all — a Lead
+there holds an empty set and could otherwise not see even the tickets they raised. It also
+fixes a case that was broken for everyone: `IN (...)` is never true for NULL, so a
+client-level ticket was invisible to every contact on the client side, its author included.
+
+An empty division set is still **not** a fallback to the whole client: a contact with every
+division toggled off sees client-level tickets only. "Not scoped yet" and "scoped to
+everything" must not be the same state, because that failure looks exactly like working.
+
+**Client Product** follows the same shape: a client-wide engagement (empty divisions table)
+is visible to every contact of that client; a division-scoped one only to a contact holding
+one of its divisions.
 
 **`has_permission`** — per-document checks, for direct access by name:
 
@@ -152,6 +193,9 @@ Product          -> manager_write_gate
 Client Product   -> manager_write_gate
 Team Member      -> manager_write_gate
 Assignment Group -> manager_write_gate
+No Reply Rule    -> manager_write_gate
+Ticket Read Receipt -> own_read_receipt_gate
+Client Product   -> manager_write_gate + client_product_has_permission
 ```
 
 `manager_write_gate` covers **all seven** org masters, not just the tenant-scoped ones.
@@ -178,8 +222,19 @@ what gives agents read access to org masters while reserving writes for managers
 
 `support_ticket.py` → `autoname()`.
 
-- Scoped tickets: `{client_code}-{division_code}-####`
-- Unscoped inbound email: `INB-####`
+Three prefixes, chosen by how much is known about the sender:
+
+| Ticket has | Prefix | Meaning |
+| --- | --- | --- |
+| client **and** division | `{client_code}-{division_code}-####` | fully scoped |
+| client, no division | `{client_code}-####` | known client, division not yet identified |
+| neither | `INB-####` | sender matched no registered contact |
+
+The client-only form exists because everything unscoped once shared `INB-`, which made a
+known client's ticket indistinguishable from an unidentified one and put every such client
+on a single global counter. **`INB-` now means only what its name says**, which makes
+"is this ticket from a stranger?" answerable as `client IS NULL` — the discriminator any
+cleanup or reporting script should use.
 
 The counter comes from Frappe's `tabSeries` via `getseries()`, which uses
 `SELECT ... FOR UPDATE`. That is deliberate: it is atomic under concurrent inserts,
@@ -188,8 +243,15 @@ failed insert rolls the number back too.
 
 `_ensure_series_floor()` handles a prefix's **first** use on a site that already has
 tickets (seeded or backfilled data), setting the counter above the highest existing
-number. Because a later explicit-name insert can still overshoot the counter, the
-autoname also skips forward past collisions rather than failing.
+number. It counts only suffixes that are **entirely digits**: a `LIKE` alone is too loose
+now that a client-only prefix exists, because `MSFT-%` also matches `MSFT-AZU-0001`, and
+seeding a client's counter from its divisions' tickets would make the numbering jump for
+no visible reason.
+
+It returns early when the `tabSeries` row already exists, so it seeds **once** and never
+corrects a counter afterwards — which is why zeroing a counter by hand sticks (see
+[Operating hazards](#resetting-the-ticket-counter)). Because a later explicit-name insert
+can still overshoot, the autoname also skips forward past collisions rather than failing.
 
 ---
 
@@ -201,16 +263,31 @@ All wired in `hooks.py`.
 
 | Trigger | What happens |
 | --- | --- |
-| **Support Ticket** `after_insert` | Acknowledgement email to the client (`email.send_ticket_ack`), plus a realtime list ping so open list/board views show it without waiting for the 30s poll |
-| **Support Ticket** `on_update` | Client emailed on client-facing status changes — Resolved / Pending Client (`email.on_ticket_update`) — plus a realtime nudge to owner, team and collaborators |
+| **Support Ticket** `after_insert` | Acknowledgement email to the client (`email.send_ticket_ack`), plus `realtime.publish_ticket_update` so open list/board views show it without waiting for the 30s poll |
+| **Support Ticket** `on_update` | Client emailed on client-facing status changes — Resolved / Pending Client (`email.on_ticket_update`) — plus `realtime.publish_ticket_update`, nudging owner, team and collaborators |
 | **Communication** `after_insert` | Inbound email becomes a ticket or a reply (`email.on_communication`) |
+| **Communication** `on_update` | Attachments that arrive after the body are moved onto the ticket (`email.on_communication_update`). Without it a file existed only in the desk, on a Communication no agent opens |
+
+### Scheduled jobs
+
+| Cron | Job |
+| --- | --- |
+| `*/2 * * * *` | `frappe.email...email_account.pull` — inbound mail. **This is how tickets arrive**; if it stops, intake stops |
+| `*/5 * * * *` | `email.reconcile_email_log` — mirrors Email Queue outcomes onto Ticket Email Log |
+
+The reconcile job is a poll rather than a hook because Email Queue writes its status with
+`frappe.db.set_value`, which fires no doc events — there is nothing to subscribe to.
+
+> A cron entry is a **ceiling, not a guarantee**: jobs only fire as often as the scheduler
+> ticks. That needs **two** site config keys set, not one — see
+> [RUNBOOK-production-mail.md](RUNBOOK-production-mail.md).
 
 ### Other hooks
 
 | Hook | Target |
 | --- | --- |
 | `on_login` | `api.activate_member_on_login` — flips an invited Team Member to Active on their first real sign-in |
-| `after_install`, `after_migrate` | `install.ensure_roles` |
+| `after_install`, `after_migrate` | `install.ensure_roles`, `install.ensure_link_expiry` — both idempotent, both re-run on every migrate |
 
 ### Realtime
 
@@ -232,9 +309,13 @@ System Users join — meaning portal users would never receive it.
 
 ## HTTP API
 
-18 whitelisted endpoints. Every mutating one is `methods=["POST"]`: without it Frappe
-defaults to allowing GET, which both skips CSRF validation and causes the write to be
-rolled back rather than committed.
+Every mutating endpoint is `methods=["POST"]`: without it Frappe defaults to allowing GET,
+which both skips CSRF validation and causes the write to be rolled back rather than
+committed.
+
+Endpoint names below are relative to **`inventive_helpdesk_backend.api`** unless a module
+is written out. The full call path is
+`/api/method/inventive_helpdesk_backend.api.<name>`.
 
 ### Tickets
 | Method | Endpoint | Purpose |
@@ -245,18 +326,42 @@ rolled back rather than committed.
 | POST | `claim_ticket` | Agent self-assigns from their team's queue. |
 | POST | `add_collaborator` / `remove_collaborator` | Loop a team or member onto a ticket. |
 | POST | `upload_attachment` | Multipart upload, stored as a private file scoped to the ticket. |
+| POST | `mark_ticket_read` | Stamps a Ticket Read Receipt for the caller. |
+| GET | `unread_tickets` | Unread count for the caller — drives the sidebar badge. |
+| GET | `ticket_stats` | Dashboard aggregates, scoped to what the caller may see. |
 
 ### Org management (manager-gated)
 | Method | Endpoint |
 | --- | --- |
 | POST | `update_client`, `update_member`, `update_product`, `update_poc`, `delete_poc` |
+| POST | `update_group` | Renames a team and/or sets its lead. **Rename first, then the lead** — the doctype is autonamed by `group_name`, so a rename changes the docname the lead write has to address. `lead=None` leaves it alone, `""` clears it. A named lead is added to the team if absent. |
+| POST | `create_contact`, `set_contact_divisions` |
+| POST | `create_client_product`, `update_client_product`, `delete_client_product` |
+| POST | `delete_product` |
 | POST | `invite_poc`, `invite_member` |
+
+### Admin delegation (owner-gated)
+
+Guarded by `_require_owner`, **not** `_require_manager` — a delegated Support Manager holds
+the full manager surface but cannot promote anyone. That keeps privilege escalation
+impossible by construction rather than by a check someone can forget.
+
+| Method | Endpoint | Purpose |
+| --- | --- | --- |
+| GET | `list_admins` | Current Lead Administrators and delegated admins. |
+| GET | `admin_candidates` | Team Members eligible for promotion. |
+| POST | `invite_admin` | Provision an admin directly, without a Team Member record first. |
+| POST | `set_member_admin` | Grant or revoke `Support Manager` for one member. |
+| POST | `revoke_account` | Disable a login — **also clears `reset_password_key`**, so an outstanding invite cannot let them back in. |
 
 ### Session and infrastructure
 | Method | Endpoint | Notes |
 | --- | --- | --- |
 | GET | `me` | Role, tenant scope, CSRF token. **GET by design** — it must work before a CSRF token is held, right after login. |
-| GET | `check` | Health + `build_sha`. Guest-callable; used by CI to verify a deploy is running the expected commit. |
+| GET | **`health.check`** | Health + `build_sha`. Guest-callable; used by CI to verify a deploy is running the expected commit. Lives in `health.py`, **not** `api.py` — `api.check` does not exist and returns a 500 that reads like the site is broken. |
+| POST | `request_password_reset` | Guest. Issues a reset key and mails the branded link. Rate-limited. |
+| POST | `password_link_status` | Guest. Reports `valid` / `expired` / `revoked` / `invalid` for a set-password key **without consuming it**, plus the support inbox to contact. Rate-limited 30/hr. |
+| POST | `set_password_with_key` | Guest. Redeems a set-password key, refusing any state but `valid`. Rate-limited 20/hr. |
 
 ---
 
@@ -281,6 +386,44 @@ The branded link requires **`app_url`** in site config. Without it the code fall
 Frappe's generic welcome mail, which points at the Frappe desk rather than the app's
 `/set-password` page.
 
+### Link lifetime and redemption
+
+Frappe has **one** setting for set-password link expiry, and the two link types need
+different answers. An invite is opened whenever the recipient next reads their mail; a
+password reset should be short-lived. So the window is derived per key rather than
+configured:
+
+| Link | Window | Derived from |
+| --- | --- | --- |
+| Invite | `INVITE_LINK_TTL_HOURS` = **24h** | `User.last_password_reset_date` is unset |
+| Reset | `RESET_LINK_TTL_HOURS` = **1h** | `last_password_reset_date` is set |
+
+`install.ensure_link_expiry` raises Frappe's `reset_password_link_expiry_duration` to 24h
+(never lowers it) so the framework does not expire an invite early; the tighter reset
+window is enforced per-key in `api._resolve_password_key`. No new field and no cache
+entry — a Redis restart cannot turn live invites into dead ones.
+
+`_resolve_password_key` returns one of four states, and **`revoked` is the security-relevant
+one**: Frappe's own `update_password` never checks `enabled` and calls `login_as()`, so a
+disabled user holding an old link could otherwise walk back in.
+
+| State | Meaning |
+| --- | --- |
+| `valid` | within window, account enabled |
+| `expired` | past the window for its kind |
+| `revoked` | account disabled — `revoke_account` also clears `reset_password_key` |
+| `invalid` | no such key (keys are stored sha256-hashed and are single-use) |
+
+Two endpoints back this. `password_link_status` is a **pre-flight check that must not
+consume the key** — mail scanners (Outlook Safe Links, Defender ATP) fetch every URL in a
+message before the human clicks it, and a consuming check would burn the link in transit.
+`set_password_with_key` wraps Frappe's `update_password`, refusing anything that is not
+`valid` and converting its string-return failure signal into a real exception.
+
+> The frontend proxy no longer forwards Frappe's raw `update_password`. The Frappe host is
+> separately reachable, though, so that endpoint still honours the 24h framework window for
+> anyone calling it directly — closing that means fronting the desk, not another guard here.
+
 ---
 
 ## Migration patches
@@ -290,14 +433,20 @@ Frappe's generic welcome mail, which points at the Frappe desk rather than the a
 | Section | Patch | Purpose |
 | --- | --- | --- |
 | pre_model_sync | `convert_child_timestamps` | Must run before the varchar→DATETIME column sync |
-| post_model_sync | `disable_orphaned_logins` | |
-| post_model_sync | `fix_uninvited_member_status` | |
+| pre_model_sync | `clear_legacy_client_product` | Retires `Client.product`, superseded by the Client Product model. **Must stay pre_model_sync** — the same release drops the DocField, and once it is gone the value is unreachable through the ORM |
+| post_model_sync | `disable_orphaned_logins` | Disables logins whose directory record no longer exists |
+| post_model_sync | `fix_uninvited_member_status` | Corrects Team Members left in the wrong status by the pre-`on_login` activation flow |
+| post_model_sync | `backfill_sender_kind` | `sender_kind` is computed in `before_save`, so tickets predating the field are blank — and blank shows the agent nothing at the moment they need to know whether a reply can be sent |
+| post_model_sync | `report_duplicate_directory_emails` | **Reports only, changes nothing.** Before `access.assert_email_unclaimed`, `Team Member.email` had no uniqueness (the doctype is named by `member_name`), so duplicates could exist |
+| post_model_sync | `backfill_contact_divisions_and_products` | Moves to the divisions-table / Client Product model. Three idempotent backfills, deliberately non-lossy — originals are left in place so a rollback costs nothing |
+| post_model_sync | `backfill_ticket_product` | Tags pre-existing tickets with a product where the division runs exactly one, so there is no guess involved |
 
 ---
 
 ## Tests
 
-28 tests, run with:
+197 tests across 15 modules in `tests/`, plus 46 more alongside the doctypes they cover —
+243 in total. Run with:
 
 ```bash
 bench --site <site> run-tests --app inventive_helpdesk_backend
@@ -307,7 +456,17 @@ They use `frappe.tests.IntegrationTestCase` (not the deprecated
 `frappe.tests.utils.FrappeTestCase`, which is scheduled for removal in v17). Coverage
 centres on the parts most likely to break silently: per-division autoname sequencing,
 tenant isolation (a client cannot read a foreign ticket, work notes are stripped from
-client reads), and the invite flows.
+client reads), reply threading, the invite flows, and set-password link states.
+
+Two are worth knowing about because they guard against failures nothing else catches:
+
+- `test_translator_not_shadowed.py` walks the AST of every module for a rebinding of `_`.
+  In this app `_` is frappe's translator, and it is also Python's conventional throwaway —
+  `_, status = f()` then makes the next `_("…")` call a document. Ruff and typing are both
+  happy with it; it only fails at runtime, on an error path, in front of a user. That exact
+  line reached a release pipeline once.
+- `test_password_link.py` covers all four link states including `revoked`, which is the one
+  that keeps a disabled account from walking back in through an old invite.
 
 Testing must be enabled on the site first:
 
@@ -329,3 +488,99 @@ because it creates users with fixed passwords:
 ```bash
 bench --site helpdesk.localhost execute inventive_helpdesk_backend.seed.run
 ```
+
+---
+
+## Operating hazards
+
+Things that have actually cost time here, and are not deducible from the code. Deployment
+lives in [CICD.md](../CICD.md); mail intake and restore have their own runbooks. This is
+the residue — the traps that sit between them.
+
+### "There is no delete option" almost always means you are not Administrator
+
+Frappe short-circuits the whole permission system for the Administrator account before it
+ever reads a permission row (`frappe/permissions.py:107`), and `get_role_permissions`
+returns `allow_everything()` for it too — which is what the desk uses to decide whether to
+*render* a button. So Administrator can already do anything, on every doctype, regardless
+of what the JSON says.
+
+**"Administrator" is a specific user account, not the System Manager role.** A System
+Manager is an ordinary user and gets exactly the rights in the permission rows. This is the
+usual explanation for a missing button, and the usual wrong fix is to grant the right to a
+role — which hands it to everyone holding that role, permanently.
+
+Editing permissions through the Role Permissions Manager also has a lasting side effect:
+`setup_custom_perms()` copies the shipped rows into `tabCustom DocPerm` and from then on
+**the app's JSON permissions are ignored for that doctype on every migrate.** "Restore
+Original Permissions" on the same page is the undo.
+
+### Ticket Email Log is read-only on purpose
+
+It is the only non-child doctype in the app without a delete permission, and the only
+record that outlives Frappe's 30-day Email Queue purge — so it is the only thing that can
+answer *"did we ever actually tell the customer?"* about anything older than a month.
+Granting Delete to Support Team hands that eraser to every agent, including the one whose
+sent mail is in dispute. Use `bench console` for a one-off instead; it runs as
+Administrator and bypasses the restriction without leaving a permanent hole.
+
+### Never delete a Communication whose ticket still exists
+
+Communication is load-bearing for mail in two independent ways:
+
+1. **Reply threading.** `_anchor_outgoing` writes it precisely so a client's reply still
+   finds its ticket after the Email Queue row is purged at 30 days. It is deliberately
+   absent from `default_log_clearing_doctypes`.
+2. **Inbound de-duplication.** `receive.py:765` `is_exist_in_system()` dedups incoming mail
+   against Communication by `message_id`.
+
+Delete one while its ticket is alive and the next client reply forks into a **brand new
+ticket**. Delete a lot of them and, if the mailbox's `UIDVALIDITY` ever changes, Frappe
+re-syncs the last 100 messages with nothing left to dedup against.
+
+The safe invariant, for any cleanup script: **a Communication is only ever deleted if its
+own ticket is being deleted in the same operation.** Deleting a ticket normally does *not*
+remove its Communications — `clear_references` only nulls `reference_name`, so they survive
+as orphans.
+
+See also the deadlock in [RUNBOOK-production-mail.md](RUNBOOK-production-mail.md): with
+`Email Sync Option = ALL`, an empty Communications table pins the IMAP watermark at
+`UID 1:101` **forever**, silently, with every health signal green.
+
+### Deleting does not mean gone
+
+`delete_doc(force=True)` still archives the full document JSON into `tabDeleted Document`.
+Only `delete_permanently=True` skips that (`frappe/model/delete_doc.py:214`). Desk deletes
+never pass it. So after "deleting" a ticket, its contents are still on the site.
+
+### bench console
+
+- It does **not** autocommit. Nothing persists without an explicit `frappe.db.commit()`.
+  `bench mariadb` does autocommit, which is exactly why this catches people out.
+- IPython mangles pasted multi-line blocks. Paste **one line at a time**, or write a file
+  and run `exec(open(f).read(), {})` with the explicit globals dict.
+- The Portainer web console silently drops large pastes — no error, the text simply never
+  arrives. Keep lines short there.
+
+### Resetting the ticket counter
+
+`tabSeries` has no desk UI. `_ensure_series_floor` seeds a prefix only on its **first** use
+(it returns early when the row already exists), so zeroing an existing row sticks and will
+not be pushed back up. Deleting the row instead makes the next ticket re-seed the floor
+from surviving tickets.
+
+```python
+frappe.db.sql("update `tabSeries` set current = 0 where name = 'INB-'")
+frappe.db.commit()
+```
+
+Verify with `select name, current from \`tabSeries\``, then prove it end to end by mailing
+in from an address that is **not** a registered contact — a known contact is named from a
+different counter, so it does not test what you think it tests.
+
+### Release order when the frontend depends on a new endpoint
+
+Deploy the **backend first** and verify the endpoint answers in production before the
+frontend that calls it goes out. The reverse order ships a UI whose requests 404. On the
+frontend side a new endpoint also needs **three** allowlists updated, not one — the
+`next.config.mjs` rewrites, the `proxy.ts` matcher, and the caller.

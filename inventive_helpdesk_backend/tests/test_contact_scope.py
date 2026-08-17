@@ -109,9 +109,16 @@ class TestContactScope(IntegrationTestCase):
         self.assertIn(self.t2.name, seen)
         self.assertNotIn(self.t3.name, seen, "a division they do not hold must stay invisible")
 
-    def test_lead_with_no_divisions_sees_nothing(self):
+    def test_lead_with_no_divisions_sees_no_division_tickets(self):
         # How a Lead is created during client onboarding, before any division exists. An
         # empty scope must deny — the failure mode to avoid is it reading as "unscoped".
+        #
+        # Named for DIVISION tickets specifically: an empty scope is not literally "sees
+        # nothing" any more, because a ticket carrying NO division is client-level and
+        # visible to every contact of that client (see TestClientLevelAndProductScope). Every
+        # fixture in this class has a division, so the exact-empty assertion below is still
+        # the right one here — but the old name would turn a correct client-level ticket
+        # added to these fixtures into a failure that looked like a regression.
         user = _contact(LEAD_EMAIL, self.client, [], is_lead=1, poc_name="Scope Lead")
         self.assertEqual(self._visible(user), set())
 
@@ -196,3 +203,141 @@ class TestReplyAddressAfterPrimaryRetired(IntegrationTestCase):
     def test_no_contact_on_the_division_yields_no_address(self):
         ticket = frappe._dict({"division": self.d1, "from_email": None, "owner": "Administrator"})
         self.assertIsNone(sender.reply_address(ticket))
+
+
+class TestClientLevelAndProductScope(IntegrationTestCase):
+    """Products a contact may see, and tickets carrying no division.
+
+    Three people, from the requirement this was built for:
+
+      A — a POC tagged into two divisions, each running its own product
+      B — a Lead at a client with NO divisions, running two client-wide products
+      C — a Lead at a client that HAS divisions, tagged into none of them
+
+    The rule is one line for each concern. Tickets: `division IN (theirs)` OR the ticket
+    carries no division and belongs to their client. Products: client-wide engagements, plus
+    those covering a division they hold.
+
+    C is the case worth writing down. Toggling every division off must leave them seeing no
+    division tickets and no division products — but still the client-wide products, because
+    those are attached to the company and not to any division. "Not scoped yet" and "scoped
+    to everything" must never collapse into the same state: that failure looks exactly like
+    the feature working.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.client = _client(CLIENT, "ZSC")
+        cls.other = _client(OTHER_CLIENT, "ZSO")
+        cls.d1 = _division(cls.client, "One", "ZS1")
+        cls.d2 = _division(cls.client, "Two", "ZS2")
+        cls.d3 = _division(cls.client, "Three", "ZS3")
+
+    def setUp(self):
+        _end_request()
+
+    def tearDown(self):
+        frappe.set_user("Administrator")
+        _end_request()
+
+    # ---- helpers ----------------------------------------------------------
+    @staticmethod
+    def _product(name):
+        if not frappe.db.exists("Product", name):
+            frappe.get_doc({"doctype": "Product", "product_name": name}).insert(ignore_permissions=True)
+        return name
+
+    @classmethod
+    def _engagement(cls, client, product, divisions):
+        return frappe.get_doc({
+            "doctype": "Client Product", "client": client, "product": cls._product(product),
+            "divisions": [{"division": d} for d in divisions],
+        }).insert(ignore_permissions=True)
+
+    @staticmethod
+    def _visible_products(user):
+        frappe.set_user(user)
+        _end_request()
+        return {r.product for r in frappe.get_list("Client Product", fields=["product"], limit_page_length=0)}
+
+    @staticmethod
+    def _visible_tickets(user):
+        frappe.set_user(user)
+        _end_request()
+        return {r.name for r in frappe.get_list("Support Ticket", fields=["name"], limit_page_length=0)}
+
+    # ---- tickets ----------------------------------------------------------
+    def test_a_contact_sees_their_divisions_tickets(self):
+        mine = _ticket(self.client, self.d1, "ZS in my division")
+        theirs = _ticket(self.client, self.d2, "ZS in another division")
+        _contact(POC_EMAIL, self.client, [self.d1])
+        seen = self._visible_tickets(POC_EMAIL)
+        self.assertIn(mine.name, seen)
+        self.assertNotIn(theirs.name, seen)
+
+    def test_a_ticket_with_no_division_is_visible_to_every_contact_of_that_client(self):
+        # Client-level: an emailed-in ticket nobody has scoped, or one raised by a contact
+        # who holds no divisions. Under a divisions-only rule this was invisible to the
+        # whole client side, including whoever raised it.
+        t = _ticket(self.client, None, "ZS client level")
+        _contact(POC_EMAIL, self.client, [self.d1])
+        self.assertIn(t.name, self._visible_tickets(POC_EMAIL))
+
+    def test_a_contact_with_no_divisions_sees_client_level_tickets_but_no_division_ones(self):
+        client_level = _ticket(self.client, None, "ZS client level for C")
+        scoped = _ticket(self.client, self.d1, "ZS division one")
+        _contact(LEAD_EMAIL, self.client, [], is_lead=1)  # C: every division toggled off
+        seen = self._visible_tickets(LEAD_EMAIL)
+        self.assertIn(client_level.name, seen)
+        self.assertNotIn(scoped.name, seen, "an unscoped lead must not see division tickets")
+
+    def test_a_client_level_ticket_of_another_client_stays_invisible(self):
+        foreign = _ticket(self.other, None, "ZS foreign client level")
+        _contact(LEAD_EMAIL, self.client, [], is_lead=1)
+        self.assertNotIn(foreign.name, self._visible_tickets(LEAD_EMAIL))
+
+    # ---- products ---------------------------------------------------------
+    def test_A_sees_the_products_of_the_divisions_they_hold(self):
+        self._engagement(self.client, "_ZS Alpha", [self.d1])
+        self._engagement(self.client, "_ZS Beta", [self.d2])
+        _contact(POC_EMAIL, self.client, [self.d1, self.d2])
+        self.assertEqual(self._visible_products(POC_EMAIL), {"_ZS Alpha", "_ZS Beta"})
+
+    def test_A_does_not_see_a_product_of_a_division_they_do_not_hold(self):
+        self._engagement(self.client, "_ZS Alpha", [self.d1])
+        self._engagement(self.client, "_ZS Gamma", [self.d3])
+        _contact(POC_EMAIL, self.client, [self.d1])
+        seen = self._visible_products(POC_EMAIL)
+        self.assertIn("_ZS Alpha", seen)
+        self.assertNotIn("_ZS Gamma", seen)
+
+    def test_B_and_C_see_client_wide_products_with_no_divisions_at_all(self):
+        self._engagement(self.client, "_ZS Wide", [])  # client-wide
+        self._engagement(self.client, "_ZS Alpha", [self.d1])
+        _contact(LEAD_EMAIL, self.client, [], is_lead=1)
+        seen = self._visible_products(LEAD_EMAIL)
+        self.assertIn("_ZS Wide", seen, "client-wide products belong to the company, not a division")
+        self.assertNotIn("_ZS Alpha", seen, "a division product must stay hidden from an unscoped lead")
+
+    def test_a_client_wide_product_is_also_visible_to_a_division_contact(self):
+        self._engagement(self.client, "_ZS Wide", [])
+        _contact(POC_EMAIL, self.client, [self.d1])
+        self.assertIn("_ZS Wide", self._visible_products(POC_EMAIL))
+
+    def test_another_clients_engagements_are_never_visible(self):
+        self._engagement(self.other, "_ZS Foreign", [])
+        _contact(POC_EMAIL, self.client, [self.d1])
+        self.assertNotIn("_ZS Foreign", self._visible_products(POC_EMAIL))
+
+    def test_get_doc_is_refused_for_an_out_of_scope_engagement(self):
+        # The half that query conditions do not cover. Without client_product_has_permission
+        # a contact could read any engagement by name, including another client's terms.
+        foreign = self._engagement(self.other, "_ZS Foreign Doc", [])
+        hidden = self._engagement(self.client, "_ZS Gamma", [self.d3])
+        _contact(POC_EMAIL, self.client, [self.d1])
+        frappe.set_user(POC_EMAIL)
+        _end_request()
+        for name in (foreign.name, hidden.name):
+            with self.assertRaises(frappe.PermissionError):
+                frappe.get_doc("Client Product", name).check_permission("read")

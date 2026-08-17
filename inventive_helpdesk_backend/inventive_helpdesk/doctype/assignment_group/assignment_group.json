@@ -8,6 +8,7 @@
  "engine": "InnoDB",
  "field_order": [
   "group_name",
+  "lead",
   "members"
  ],
  "fields": [
@@ -18,6 +19,15 @@
    "label": "Group Name",
    "reqd": 1,
    "unique": 1
+  },
+  {
+   "fieldname": "lead",
+   "fieldtype": "Link",
+   "options": "Team Member",
+   "label": "Team Lead",
+   "in_list_view": 1,
+   "search_index": 1,
+   "description": "Optional. A team can run without one, and clearing it is a normal thing to do when someone moves on — so this is never required."
   },
   {
    "fieldname": "members",

@@ -16,7 +16,6 @@
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — data model, roles and permission enforcement, hooks, HTTP API, ticket numbering, invites.
 - [CICD.md](CICD.md) — build pipeline, Portainer/Swarm deployment, first-deploy sequence, rollback.
-- [docs/DESIGN-email-reply-workflow.md](docs/DESIGN-email-reply-workflow.md) — sender classification and what happens to a staff reply.
 - [docs/RUNBOOK-production-mail.md](docs/RUNBOOK-production-mail.md) — turning on the real mailbox in production.
 - [docs/RUNBOOK-backup-and-restore.md](docs/RUNBOOK-backup-and-restore.md) — what is backed up, what is not, and how to restore a site.
 
