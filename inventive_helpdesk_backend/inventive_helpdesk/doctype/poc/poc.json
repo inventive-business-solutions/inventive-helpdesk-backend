@@ -15,7 +15,8 @@
   "division",
   "divisions",
   "user",
-  "invited_on"
+  "invited_on",
+  "activated_on"
  ],
  "fields": [
   {
@@ -78,7 +79,7 @@
    "options": "User"
   },
   {
-   "description": "When the portal invite was last (re)sent. A login after this time flips the POC to Active.",
+   "description": "When the portal invite was last (re)sent. Resending clears activated_on, so the contact reads Invited again until they redeem the new link.",
    "fieldname": "invited_on",
    "fieldtype": "Datetime",
    "label": "Invited On",
@@ -90,6 +91,13 @@
    "fieldtype": "Check",
    "label": "Primary (retired)",
    "description": "Retired in favour of Leads. Not read anywhere; dropped in a later release."
+  },
+  {
+   "description": "When this contact chose a password and completed activation. Set by set_password_with_key, cleared by a resend. This is what the portal chip reads — not whether they have ever signed in.",
+   "fieldname": "activated_on",
+   "fieldtype": "Datetime",
+   "label": "Activated On",
+   "read_only": 1
   }
  ],
  "grid_page_length": 50,

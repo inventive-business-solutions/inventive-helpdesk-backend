@@ -286,7 +286,6 @@ The reconcile job is a poll rather than a hook because Email Queue writes its st
 
 | Hook | Target |
 | --- | --- |
-| `on_login` | `api.activate_member_on_login` — flips an invited Team Member to Active on their first real sign-in |
 | `after_install`, `after_migrate` | `install.ensure_roles`, `install.ensure_link_expiry` — both idempotent, both re-run on every migrate |
 
 ### Realtime
@@ -370,11 +369,21 @@ impossible by construction rather than by a check someone can forget.
 `invite_poc` and `invite_member` both provision a login, link it back to the record, and
 email a set-password link. Both are idempotent — safe to call again to resend.
 
-- **POC** → Website User + Support Client role. `invited_on` is restamped on every send;
-  the UI compares `last_login` against it, so a stale resend cannot read "Active" off a
-  login that predates it.
-- **Team Member** → System User + Support Team role, status set to Invited. Activation is
-  event-driven via `on_login` rather than a timestamp compare.
+- **POC** → Website User + Support Client role. `invited_on` is restamped and
+  `activated_on` cleared on every send.
+- **Team Member** → System User + Support Team role, status reset to Invited.
+
+**Activation means "chose a password", not "signed in".** Both shapes are stamped by
+`_mark_activated`, called from `set_password_with_key` — staff via `Team Member.status`,
+contacts via `POC.activated_on`. A resend clears it, so the new link has to be redeemed
+before either reads Active again.
+
+This used to be inferred from signing in — an `on_login` hook for staff, a
+`last_login` vs `invited_on` compare for contacts — which answered the wrong question
+(an invite is not outstanding just because someone has not been back lately) and let a
+resent invite be defeated with the old password. The hook is gone. The `last_login`
+compare survives only as a fallback in `pocPortalStatus`, for rows the backfill could
+not date and for a frontend running against an unmigrated backend.
 
 **Email delivery is best-effort by design.** `_send_invite_mail` catches
 `OutgoingEmailError` and returns `False`, so a site with no outgoing mail account still
@@ -440,6 +449,7 @@ message before the human clicks it, and a consuming check would burn the link in
 | post_model_sync | `report_duplicate_directory_emails` | **Reports only, changes nothing.** Before `access.assert_email_unclaimed`, `Team Member.email` had no uniqueness (the doctype is named by `member_name`), so duplicates could exist |
 | post_model_sync | `backfill_contact_divisions_and_products` | Moves to the divisions-table / Client Product model. Three idempotent backfills, deliberately non-lossy — originals are left in place so a rollback costs nothing |
 | post_model_sync | `backfill_ticket_product` | Tags pre-existing tickets with a product where the division runs exactly one, so there is no guess involved |
+| post_model_sync | `backfill_activation_state` | Seeds stored activation (`POC.activated_on`, `Team Member.status`) from `last_login`. Without it every already-activated person reads Invited the moment activation stops being inferred from signing in — and the obvious remedy, resending the invite, is exactly wrong |
 
 ---
 

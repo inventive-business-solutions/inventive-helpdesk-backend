@@ -104,8 +104,11 @@ doc_events = {
 }
 
 # --- Inventive Helpdesk: staff onboarding ---
-# Flip an invited Team Member to Active the first time they actually sign in.
-on_login = "inventive_helpdesk_backend.api.activate_member_on_login"
+# There is deliberately no on_login hook here any more. Activation is stamped when a
+# password is chosen (api._mark_activated), because that is the question the Members and
+# Contacts chips are asking. Promoting on sign-in instead let someone who had been reset
+# to Invited by a resend climb back to Active using their OLD password, without ever
+# opening the new link.
 
 # --- Inventive Helpdesk: inbound mail cadence ---
 # Frappe ships this job at `0/10 * * * *`, which behind the scheduler tick means a customer

@@ -60,11 +60,33 @@ def _issue_key(user, *, hours_ago=0, ever_set_password=False):
     return raw
 
 
+def _clear_login_manager():
+    try:
+        del frappe.local.login_manager
+    except Exception:
+        pass
+
+
+class _StubLoginManager:
+    """update_password signs the user in on success, and `frappe.local.login_manager` only
+    exists inside a real request. Stubbing it keeps these tests on OUR half of the contract
+    — telling a refusal from a success, and stamping activation — instead of standing up
+    Frappe's session machinery to observe a return value."""
+
+    def __init__(self):
+        self.user = None
+
+    def login_as(self, user, *args, **kwargs):
+        self.user = user
+
+
 class TestPasswordLink(IntegrationTestCase):
     def setUp(self):
         self.user = _user(INVITEE)
         self.user.db_set("enabled", 1)
         self.user.reload()
+        frappe.local.login_manager = _StubLoginManager()
+        self.addCleanup(_clear_login_manager)
 
     def test_fresh_invite_is_valid(self):
         key = _issue_key(self.user)
@@ -145,3 +167,58 @@ class TestPasswordLink(IntegrationTestCase):
         key = _issue_key(self.user, hours_ago=INVITE_LINK_TTL_HOURS + 1)
         with self.assertRaises(frappe.PermissionError):
             set_password_with_key(key=key, new_password="Str0ng-Passw0rd!x")
+
+    def test_successful_redemption_returns_ok_and_spends_the_key(self):
+        """The regression this file exists to prevent recurring.
+
+        update_password returns a STRING on success too — a post-login redirect path — so
+        the old `isinstance(result, str)` check threw frappe.PermissionError on every
+        successful activation. Frappe rolls the request back on any exception, so the key
+        update_password had just cleared came back, leaving the invite link redeemable
+        again; the person meanwhile saw the raw path, or "Logged In", in the error slot.
+        """
+        key = _issue_key(self.user)
+        out = set_password_with_key(key=key, new_password="Str0ng-Passw0rd!x")
+        self.assertEqual(out, {"ok": True})
+        # Spent, not merely reported as spent.
+        self.assertFalse(frappe.db.get_value("User", INVITEE, "reset_password_key"))
+        _, status = _resolve_password_key(key)
+        self.assertEqual(status, LINK_INVALID)
+
+    def test_redemption_activates_a_team_member(self):
+        """The chip answers "has this person chosen a password?", so redeeming is what
+        flips it — not signing in, which used to be inferred via an on_login hook."""
+        member = frappe.get_doc(
+            {
+                "doctype": "Team Member",
+                "member_name": "_Test Activation Member",
+                "email": INVITEE,
+                "status": "Invited",
+                "user": INVITEE,
+            }
+        ).insert(ignore_permissions=True)
+        self.addCleanup(frappe.delete_doc, "Team Member", member.name, force=True)
+
+        set_password_with_key(key=_issue_key(self.user), new_password="Str0ng-Passw0rd!x")
+        self.assertEqual(frappe.db.get_value("Team Member", member.name, "status"), "Active")
+
+    def test_redemption_stamps_a_contact(self):
+        client = frappe.get_doc(
+            {"doctype": "Client", "client_name": "_Test Activation Client", "client_code": "TAC"}
+        ).insert(ignore_permissions=True)
+        self.addCleanup(frappe.delete_doc, "Client", client.name, force=True)
+        poc = frappe.get_doc(
+            {
+                "doctype": "POC",
+                "poc_name": "Activation Contact",
+                "email": INVITEE,
+                "client": client.name,
+                "user": INVITEE,
+                "invited_on": now_datetime(),
+            }
+        ).insert(ignore_permissions=True)
+        self.addCleanup(frappe.delete_doc, "POC", poc.name, force=True)
+
+        self.assertIsNone(frappe.db.get_value("POC", poc.name, "activated_on"))
+        set_password_with_key(key=_issue_key(self.user), new_password="Str0ng-Passw0rd!x")
+        self.assertIsNotNone(frappe.db.get_value("POC", poc.name, "activated_on"))

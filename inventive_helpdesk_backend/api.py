@@ -1523,7 +1523,7 @@ def set_password_with_key(key, new_password):
     """
     from frappe.core.doctype.user.user import update_password
 
-    _user, status = _resolve_password_key(key)
+    user, status = _resolve_password_key(key)
     if status != LINK_VALID:
         # PermissionError, and no hand-set status code. 410 Gone would describe an expired
         # link better, but frappe.throw derives the response code from the exception type
@@ -1539,13 +1539,39 @@ def set_password_with_key(key, new_password):
         )
 
     result = update_password(new_password=new_password, key=key)
-    # A string back means it refused. Frappe signals that by setting a 410 and RETURNING the
-    # message rather than raising, so an un-checked caller reads a refusal as success. Our
-    # window is tighter than Frappe's on resets and equal on invites, so in practice this
-    # only fires on a race — the key consumed between our check and its own.
-    if isinstance(result, str):
+    # update_password returns a STRING in BOTH outcomes, so the return type says nothing:
+    #   refusal -> sets response.http_status_code = 410 and returns the message
+    #   success -> returns a post-login redirect path ("/desk", the portal home, ...)
+    # The status code is the only discriminator. Testing `isinstance(result, str)` instead
+    # threw frappe.PermissionError on every SUCCESSFUL activation, and because app.py
+    # rolls the request back on any exception, everything update_password wrote after its
+    # own mid-request commit was discarded — most importantly reset_password_key, which
+    # stayed populated and left the invite link redeemable again and again. The person
+    # meanwhile saw the raw redirect path, or "Logged In", in the form's error slot.
+    if frappe.local.response.http_status_code == 410:
         frappe.throw(result, frappe.PermissionError)
+    # .name, not the doc — _resolve_password_key hands back a User document.
+    _mark_activated(user.name)
     return {"ok": True}
+
+
+def _mark_activated(user: str) -> None:
+    """Record that this login has finished activation by choosing a password.
+
+    Deliberately NOT left to the on_login hook. Activation and signing in are different
+    facts, and the admin-facing chip is meant to answer the first one: "has this person
+    picked a password yet, or is that invite still outstanding?" It only ever looked right
+    by accident — update_password calls login_as internally, so on_login fired during
+    activation and Frappe's session-creation commit happened to persist it. Nothing in the
+    flow intended that, and any change to how activation signs someone in would have
+    silently taken the chip with it.
+
+    Both shapes are stamped because a login can be either, and never both: a Team Member
+    is staff, a POC is a client contact.
+    """
+    frappe.db.set_value("Team Member", {"user": user}, "status", "Active", update_modified=False)
+    for poc in frappe.get_all("POC", filters={"user": user}, pluck="name"):
+        frappe.db.set_value("POC", poc, "activated_on", now_datetime(), update_modified=False)
 
 
 @frappe.whitelist(methods=["POST"])
@@ -1563,13 +1589,15 @@ def invite_poc(poc):
 
     user = _ensure_login_user(email, doc.poc_name, "Website User", "Support Client", "POC", doc.name)
 
-    # Link the account and (re)stamp the invite time. invited_on is the reference the
-    # UI compares last_login against: a sign-in *after* this moment marks the POC Active.
-    # Restamping on every (re)send resets that clock, so a stale Resend can't read Active
-    # off a login that predates it — and a re-used pre-existing User (whose last_login may
-    # already be set) correctly stays Invited until they sign in for this invite.
+    # Link the account, (re)stamp the invite time, and drop any previous activation.
+    # Clearing activated_on is what gives Resend its meaning: the new link has to be
+    # redeemed before this contact reads Active again, so a resend is a real "prove
+    # yourself again" rather than a mail that changes nothing on screen. It also keeps a
+    # re-used pre-existing User honest — inheriting someone's earlier activation would
+    # show Active for an invite nobody has answered.
     doc.user = user.name
     doc.invited_on = now_datetime()
+    doc.activated_on = None
     doc.save(ignore_permissions=True)
 
     # Their existing tickets were classified "Known Contact" — no login, so email-only.
@@ -1588,8 +1616,8 @@ def invite_poc(poc):
 def invite_member(member):
     """Provision (or re-notify) a team member's staff login. Creates a System User with
     the Support Team role, links it via Team Member.user, marks the member Invited and
-    emails a set-password link. The member flips to Active automatically the first time
-    they sign in (see activate_member_on_login). Idempotent: safe to call to resend."""
+    emails a set-password link. The member flips to Active when they redeem that link and
+    choose a password (see _mark_activated). Idempotent: safe to call to resend."""
     _require_manager()
     doc = frappe.get_doc("Team Member", member)
     email = (doc.email or "").strip()
@@ -1598,23 +1626,11 @@ def invite_member(member):
 
     user = _ensure_login_user(email, doc.member_name, "System User", "Support Team", "Team Member", doc.name)
 
-    # Link the account and reset the member to Invited. There is no timestamp compare
-    # here (unlike POCs): activation is event-driven via the on_login hook, which only
-    # fires on a real sign-in *after* this — so a re-used account with an old last_login
-    # correctly stays Invited until they actually log in again for this invite.
+    # Link the account and reset the member to Invited. Same rule as a POC resend: the new
+    # link has to be redeemed before they read Active again. Nothing promotes them on
+    # sign-in any more, so a re-used account with an old password cannot climb back.
     doc.user = user.name
     doc.status = "Invited"
     doc.save(ignore_permissions=True)
 
     return {"user": user.name, "email_sent": _send_invite_mail(user, "Team member")}
-
-
-def activate_member_on_login(login_manager):
-    """on_login hook: the moment an invited team member actually signs in, mark them
-    Active — that is how staff onboarding completes. Runs on every login; it's a cheap
-    no-op for the Administrator, portal/POC users, and already-active members. (POC
-    portal activation is derived separately from last_login vs POC.invited_on.)"""
-    user = getattr(login_manager, "user", None) or frappe.session.user
-    if not user or user in ("Guest", "Administrator"):
-        return
-    frappe.db.set_value("Team Member", {"user": user, "status": "Invited"}, "status", "Active")
